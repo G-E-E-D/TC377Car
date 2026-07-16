@@ -6,14 +6,22 @@
 typedef enum
 {
     CAR_STATE_SELF_TEST = 0,
-    CAR_STATE_WAIT_GPS,
+    CAR_STATE_WAIT_START,
     CAR_STATE_RECORDING,
+    CAR_STATE_PROCESSING,
     CAR_STATE_READY,
     CAR_STATE_GUIDE,
     CAR_STATE_FINISHED,
     CAR_STATE_RECORD_FULL,
     CAR_STATE_ERROR,
 } car_state_enum;
+
+typedef enum
+{
+    CAR_REPLAY_NONE = 0,
+    CAR_REPLAY_A_FORWARD,
+    CAR_REPLAY_B_RETURN,
+} car_replay_mode_enum;
 
 typedef struct
 {
@@ -52,6 +60,7 @@ typedef struct
 } car_pose_struct;
 
 extern volatile car_state_enum car_state;
+extern volatile car_replay_mode_enum car_replay_mode;
 extern volatile uint32 car_elapsed_ms;
 extern volatile uint8 car_key1_level;
 extern volatile uint8 car_key2_level;
@@ -108,9 +117,11 @@ extern volatile uint8 car_pwm_sim_gps_dir_locked;
 extern volatile int16 car_steer_pwm_output;
 extern volatile int16 car_rear_pwm_output;
 extern volatile int8 car_drive_direction;
+extern volatile uint8 car_track_correction_active;
 
 void  car_nav_init             (void);
 void  car_nav_control_10ms     (void);
+void  car_nav_background       (void);
 void  car_nav_display          (void);
 void  car_nav_gnss_poll        (void);
 float car_pid_calc             (car_pid_struct *pid, float target, float current);

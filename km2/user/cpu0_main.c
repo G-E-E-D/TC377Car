@@ -16,6 +16,7 @@ int core0_main(void)
     while(TRUE)
     {
         car_nav_gnss_poll();
+        car_nav_background();
         car_nav_display();
         system_delay_ms(CAR_UI_REFRESH_MS);
     }

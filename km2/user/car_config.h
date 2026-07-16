@@ -5,8 +5,8 @@
 
 //==================================================== hardware mapping ====================================================
 #define CAR_USE_BOARD_KEYS             (1)
-#define CAR_GUIDE_KEY_PIN              (P20_6)
-#define CAR_RESET_KEY_PIN              (P20_7)
+#define CAR_KEY_A_PIN                  (P20_6)      // Board KEY1: start/stop teach, then start A (start -> finish).
+#define CAR_KEY_B_PIN                  (P20_7)      // Board KEY2: stop teach, then start B (finish -> start).
 #define CAR_KEY_RELEASE_LEVEL          (GPIO_HIGH)
 #define CAR_KEY_ACTIVE_LEVEL           (GPIO_LOW)
 #define CAR_KEY_COOLDOWN_COUNT         (30)          // 30 * 10ms = 300ms debounce/cooldown.
@@ -37,7 +37,7 @@
 #define CAR_STEER_ENCODER_CH1_PIN      (TIM2_ENCODER_CH1_P33_7)
 #define CAR_STEER_ENCODER_CH2_PIN      (TIM2_ENCODER_CH2_P33_6)
 #define CAR_STEER_ENCODER_REVERSE      (0)
-#define CAR_STEER_ENCODER_DIR_MODE     (1)
+#define CAR_STEER_ENCODER_DIR_MODE     (0)          // The PDF specifies dual-Hall A/B quadrature outputs.
 
 #define CAR_IPS200_TYPE                (IPS200_TYPE_SPI)
 #define CAR_GNSS_DEVICE                (TAU1201)
@@ -51,16 +51,16 @@
 #define CAR_DISPLAY_SIM_COLOR          (0x07FF)     // RGB565 cyan.
 
 //==================================================== vehicle parameters ====================================================
-#define CAR_PATH_MAX_POINTS            (1800)
-#define CAR_PATH_RECORD_INTERVAL_MS    (50)        // 1800 * 50ms = 90s teaching route.
-#define CAR_PATH_RECORD_MIN_MOVE_M     (0.100f)     // Store spatial GPS fixes, not 10ms IMU drift points.
-#define CAR_PATH_RECORD_MIN_SPEED_MPS  (0.12f)
+#define CAR_PATH_MAX_POINTS            (2400)
+#define CAR_PATH_RECORD_INTERVAL_MS    (50)          // 2400 * 50ms = 120s maximum teaching route.
+#define CAR_PATH_RECORD_MIN_MOVE_M     (0.015f)       // 0.35m/s creates about one fused point every 50ms.
+#define CAR_PATH_RECORD_MIN_SPEED_MPS  (0.08f)
 #define CAR_PATH_RECORD_USE_YAW        (0)
 #define CAR_PATH_RECORD_MIN_YAW_DEG    (3.00f)
-#define CAR_PATH_RECORD_USE_STEER      (0)          // Steering changes without translation are not route points.
+#define CAR_PATH_RECORD_USE_STEER      (1)           // Front steering encoder is a primary teaching input.
 #define CAR_PATH_RECORD_MIN_STEER      (10.0f)
-#define CAR_PATH_SMOOTH_PASSES         (3)
-#define CAR_PATH_RESAMPLE_M            (0.180f)
+#define CAR_PATH_SMOOTH_PASSES         (5)
+#define CAR_PATH_RESAMPLE_M            (0.100f)
 #define CAR_PATH_DIRECTION_CONFIRM_PT  (3)
 #define CAR_TIME_LOOKAHEAD_MS          (300)
 #define CAR_PATH_FINISH_DISTANCE_M     (0.450f)
@@ -73,9 +73,9 @@
 #define CAR_STEER_ANGLE_SIGN           (-1.0f)       // ENC=-100 is left; left turn is positive model yaw.
 #define CAR_STEER_MODEL_ENABLE         (1)
 #define CAR_STEER_MODEL_MIN_SPEED_MPS  (0.12f)
-#define CAR_STEER_MODEL_BLEND          (0.12f)       // 0=gyro only, 1=steer model only. Keep small at first.
+#define CAR_STEER_MODEL_BLEND          (0.80f)       // GPS position + front encoder bicycle model are primary.
 #define CAR_STEER_MODEL_MAX_YAW_DPS    (180.0f)
-#define CAR_STEER_SELF_TEST_ENABLE     (1)
+#define CAR_STEER_SELF_TEST_ENABLE     (0)           // Power-on must remain stopped and wait for a key.
 #define CAR_STEER_SELF_TEST_DELAY_MS   (1000)
 #define CAR_STEER_SELF_TEST_LEFT_CNT   (-105.0f)
 #define CAR_STEER_SELF_TEST_RIGHT_CNT  (105.0f)
@@ -128,12 +128,12 @@
 #define CAR_RAD_TO_DEG                 (57.295779513f)
 #define CAR_GPS_MIN_SATELLITES         (6)
 #define CAR_ALLOW_RECORD_WITHOUT_GPS   (0)
-#define CAR_GPS_FILTER_WINDOW          (5)
-#define CAR_GPS_FILTER_ALPHA           (0.35f)
+#define CAR_GPS_FILTER_WINDOW          (3)
+#define CAR_GPS_FILTER_ALPHA           (0.55f)
 #define CAR_GPS_STALE_MS               (600)
 #define CAR_GPS_POS_BLEND              (0.015f)
 #define CAR_GPS_YAW_BLEND              (0.010f)
-#define CAR_GPS_YAW_MIN_SPEED_KMH      (1.2f)
+#define CAR_GPS_YAW_MIN_SPEED_KMH      (3.0f)        // Low-speed course is noisy; use steering encoder yaw instead.
 #define CAR_GPS_MAX_CORRECT_M          (3.0f)
 #define CAR_GPS_SPEED_BLEND            (0.20f)
 #define CAR_GPS_TRACK_ENABLE           (1)          // GPS is a slow spatial corrector, not the main slalom feedback.
@@ -146,7 +146,7 @@
 #define CAR_EKF_Q_SPEED                (0.0180f)
 #define CAR_EKF_Q_GYRO_BIAS            (0.0000008f)
 #define CAR_EKF_Q_ACC_BIAS             (0.000080f)
-#define CAR_EKF_R_GPS_POS              (0.45f)       // Filtered 10Hz TAU1201 fixes are the long-term position reference.
+#define CAR_EKF_R_GPS_POS              (0.18f)       // Filtered 10Hz TAU1201 fixes strongly anchor the fused path.
 #define CAR_EKF_R_GPS_SPEED            (0.040f)
 #define CAR_EKF_R_GPS_YAW_RAD          (0.035f)
 #define CAR_EKF_R_STILL_SPEED          (0.004f)
@@ -157,10 +157,12 @@
 #define CAR_REAR_DUTY_LIMIT            (5200)
 #define CAR_REAR_MIN_MOVE_DUTY         (1500)
 #define CAR_REAR_PWM_SLEW_STEP         (140)
-#define CAR_DEFAULT_TARGET_SPEED_MPS   (0.45f)
+#define CAR_LOW_SPEED_MPS              (0.35f)        // Fixed teaching/A/B model speed; calibrate on the real car.
+#define CAR_LOW_SPEED_REAR_PWM         (2000)         // Fixed low rear PWM used in teaching and both replay modes.
+#define CAR_DEFAULT_TARGET_SPEED_MPS   (CAR_LOW_SPEED_MPS)
 #define CAR_MIN_TARGET_SPEED_MPS       (0.20f)
-#define CAR_MAX_TARGET_SPEED_MPS       (0.70f)
-#define CAR_REPLAY_SPEED_SCALE         (0.70f)      // Start slow, then increase after the steering loop is stable.
+#define CAR_MAX_TARGET_SPEED_MPS       (0.55f)
+#define CAR_REPLAY_SPEED_SCALE         (1.00f)
 #define CAR_CURVE_SPEED_GAIN           (1.60f)
 #define CAR_GUIDE_FIXED_REAR_PWM       (1)          // 1: use one fixed rear PWM during GUIDE, ignoring noisy VEL feedback.
 #define CAR_GUIDE_FIXED_SPEED_MIN_MPS  (0.20f)
@@ -184,12 +186,21 @@
 #define CAR_STEER_PWM_LIMIT            (6000)
 #define CAR_STEER_MOVE_MIN_DUTY        (3500)
 #define CAR_STEER_POSITION_TOL_CNT     (3.0f)
-#define CAR_STEER_FF_GAIN              (0.00f)       // Recorded hand steering is diagnostic only.
+#define CAR_STEER_FF_GAIN              (1.00f)       // Replay the smoothed front-encoder steering inside the corridor.
 #define CAR_STEER_YAW_K                (0.0f)        // Pure Pursuit now creates the steering target directly.
 #define CAR_STEER_RATE_K               (0.0f)
 #define CAR_STEER_CTE_K                (0.0f)
 #define CAR_GPS_CTE_LIMIT_M            (1.20f)
 #define CAR_GPS_CTE_MIN_SPEED_MPS      (0.15f)
+
+// Outside this corridor, an outer PID adds steering correction. Inside it, correction is exactly zero.
+#define CAR_TRACK_TOLERANCE_M           (0.35f)
+#define CAR_TRACK_CORRECTION_KP         (80.0f)
+#define CAR_TRACK_CORRECTION_KI         (0.0f)
+#define CAR_TRACK_CORRECTION_KD         (12.0f)
+#define CAR_TRACK_INTEGRAL_LIMIT        (2.0f)
+#define CAR_TRACK_CORRECTION_LIMIT      (55.0f)
+#define CAR_TRACK_HEADING_K             (0.35f)
 
 #define CAR_STEER_POS_KP               (18.0f)
 #define CAR_STEER_POS_KI               (0.0f)
@@ -203,6 +214,6 @@
 #define CAR_SPEED_FEEDFORWARD          (2800.0f)
 #define CAR_SIGNED_SPEED_DEADBAND_MPS  (0.06f)
 
-#define CAR_APP_VERSION_TEXT           "KM2_PP_20260716C"
+#define CAR_APP_VERSION_TEXT           "KM2_AB_20260716D"
 
 #endif
