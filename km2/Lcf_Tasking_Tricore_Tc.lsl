@@ -28,7 +28,7 @@
  
 #define LCF_CSA0_SIZE 8k
 #define LCF_USTACK0_SIZE 2k
-#define LCF_ISTACK0_SIZE 1k
+#define LCF_ISTACK0_SIZE 4k
 
 #define LCF_CSA1_SIZE 8k
 #define LCF_USTACK1_SIZE 2k
@@ -294,7 +294,7 @@ derivative tc37
     section_setup :vtc:linear
     {
         stack "ustack_tc0" (min_size = 1k, fixed, align = 8);
-        stack "istack_tc0" (min_size = 1k, fixed, align = 8);
+        stack "istack_tc0" (min_size = 4k, fixed, align = 8);
         stack "ustack_tc1" (min_size = 1k, fixed, align = 8);
         stack "istack_tc1" (min_size = 1k, fixed, align = 8);
         stack "ustack_tc2" (min_size = 1k, fixed, align = 8);

@@ -17,6 +17,7 @@
 #define CAR_ERROR_GPS_LOST             (3)
 #define CAR_ERROR_START_TOO_FAR        (4)
 #define CAR_ERROR_GPS_CORRIDOR         (5)
+#define CAR_ERROR_GUIDE_TIMEOUT        (6)
 
 #define CAR_LEFT_MOTOR_DIR_PIN         (P21_4)
 #define CAR_LEFT_MOTOR_PWM_CH          (ATOM0_CH3_P21_5)
@@ -65,6 +66,8 @@
 #define CAR_TIME_LOOKAHEAD_MS          (300)
 #define CAR_PATH_FINISH_DISTANCE_M     (0.450f)
 #define CAR_PATH_FINISH_INDEX_REMAIN   (6)
+#define CAR_PATH_FINISH_INDEX_STOP     (1)           // Fail-safe stop at the final spatial sample even if GPS range is biased.
+#define CAR_PATH_FINISH_STOP_FIX_COUNT (3)           // Confirm the fail-safe endpoint with consecutive new RMC fixes.
 #define CAR_START_MIN_POINTS           (8)
 #define CAR_GUIDE_START_MAX_DIST_M     (2.00f)
 #define CAR_WHEELBASE_M                (0.260f)      // Measure front axle to rear axle, then update this value.
@@ -127,6 +130,7 @@
 #define CAR_DEG_TO_RAD                 (0.01745329252f)
 #define CAR_RAD_TO_DEG                 (57.295779513f)
 #define CAR_GPS_MIN_SATELLITES         (6)
+#define CAR_GPS_READY_FIX_COUNT        (10)          // Require consecutive valid frames before a key can start motion.
 #define CAR_ALLOW_RECORD_WITHOUT_GPS   (0)
 #define CAR_GPS_FILTER_WINDOW          (3)
 #define CAR_GPS_FILTER_ALPHA           (0.55f)
@@ -214,6 +218,6 @@
 #define CAR_SPEED_FEEDFORWARD          (2800.0f)
 #define CAR_SIGNED_SPEED_DEADBAND_MPS  (0.06f)
 
-#define CAR_APP_VERSION_TEXT           "KM2_AB_20260716D"
+#define CAR_APP_VERSION_TEXT           "KM2_AB_20260716E"
 
 #endif

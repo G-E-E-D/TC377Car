@@ -82,8 +82,9 @@ static float gps_filter_x[CAR_GPS_FILTER_WINDOW] = {0.0f};
 static float gps_filter_y[CAR_GPS_FILTER_WINDOW] = {0.0f};
 static uint8 gps_filter_count = 0;
 static uint8 gps_filter_index = 0;
-static uint32 gps_last_update_ms = 0;
-static uint32 nav_uptime_ms = 0;
+static volatile uint8 gps_valid_fix_streak = 0;
+static volatile uint32 gps_last_update_ms = 0;
+static volatile uint32 nav_uptime_ms = 0;
 static uint32 gps_stop_last_fix = 0;
 static uint32 last_record_ms = 0;
 static float last_record_x = 0.0f;
@@ -104,19 +105,13 @@ static float guide_start_gps_y_m = 0.0f;
 static uint32 self_test_step_start_ms = 0;
 static uint8 self_test_settle_count = 0;
 static uint16 gps_priority_stop_count = 0;
-static int8 guide_active_direction = 0;
-static int8 guide_pending_direction = 0;
-static uint16 guide_direction_hold_count = 0;
+static volatile uint8 car_path_prepared = 0;
+static uint8 finish_endpoint_fix_count = 0;
+static uint32 finish_last_fix = 0;
 
 static car_pid_struct steer_pos_pid = {
         CAR_STEER_POS_KP, CAR_STEER_POS_KI, CAR_STEER_POS_KD,
         CAR_STEER_INTEGRAL_LIMIT, CAR_STEER_PWM_LIMIT,
-        0.0f, 0.0f, 0.0f
-};
-
-static car_pid_struct speed_pid = {
-        CAR_SPEED_KP, CAR_SPEED_KI, CAR_SPEED_KD,
-        CAR_SPEED_INTEGRAL_LIMIT, CAR_REAR_DUTY_LIMIT,
         0.0f, 0.0f, 0.0f
 };
 
@@ -284,15 +279,6 @@ static float car_steer_count_to_angle_deg(float steer_count)
     return car_limit_f(angle, CAR_STEER_MAX_ANGLE_DEG);
 }
 
-static float car_steer_angle_to_count(float steer_angle_deg)
-{
-    float count;
-
-    count = steer_angle_deg
-          / ((CAR_STEER_MAX_ANGLE_DEG / CAR_STEER_ENC_MAX_ABS_COUNT) * CAR_STEER_ANGLE_SIGN);
-    return car_limit_f(count, CAR_STEER_TARGET_LIMIT);
-}
-
 static float car_steer_model_yaw_rate_dps(float speed_mps, float steer_count)
 {
 #if CAR_STEER_MODEL_ENABLE
@@ -323,48 +309,6 @@ static void car_pwm_sim_reset(void)
     car_pwm_sim_steer_angle_deg = 0.0f;
     car_pwm_sim_nearest_index = 0;
     car_pwm_sim_gps_dir_locked = 0;
-}
-
-static float car_path_start_course_deg(void)
-{
-    uint32 i;
-    uint32 scan_count;
-    float dx;
-    float dy;
-    float dist2;
-    float best_dx = 0.0f;
-    float best_dy = 0.0f;
-    float best_dist2 = 0.0f;
-    float min_dist2 = CAR_GUIDE_SIM_START_MIN_DIST_M * CAR_GUIDE_SIM_START_MIN_DIST_M;
-
-    scan_count = car_path_count;
-    if(scan_count > CAR_GUIDE_SIM_START_SCAN)
-    {
-        scan_count = CAR_GUIDE_SIM_START_SCAN;
-    }
-
-    for(i = 1; i < scan_count; i++)
-    {
-        dx = car_path[i].x - car_path[0].x;
-        dy = car_path[i].y - car_path[0].y;
-        dist2 = dx * dx + dy * dy;
-        if(dist2 > best_dist2)
-        {
-            best_dist2 = dist2;
-            best_dx = dx;
-            best_dy = dy;
-        }
-        if(dist2 >= min_dist2)
-        {
-            return (float)atan2(dy, dx) * CAR_RAD_TO_DEG;
-        }
-    }
-
-    if(best_dist2 > 0.0004f)
-    {
-        return (float)atan2(best_dy, best_dx) * CAR_RAD_TO_DEG;
-    }
-    return 0.0f;
 }
 
 static void car_pwm_sim_update(void)
@@ -806,6 +750,7 @@ void car_all_motor_stop(void)
     rear_pwm_ramped = 0;
 }
 
+#if CAR_STEER_SELF_TEST_ENABLE
 static uint8 car_self_test_target_reached(float target_count)
 {
     float error = target_count - (float)car_steer_encoder_count;
@@ -876,6 +821,7 @@ static void car_self_test_drive_rear(int16 rear_pwm)
     car_motor_set(CAR_RIGHT_MOTOR_PWM_CH, CAR_RIGHT_MOTOR_DIR_PIN, rear_pwm * CAR_RIGHT_MOTOR_DUTY_SIGN, CAR_MOTOR_FORWARD_LEVEL, CAR_MOTOR_REVERSE_LEVEL);
     car_motor_set(CAR_STEER_MOTOR_PWM_CH, CAR_STEER_MOTOR_DIR_PIN, 0, CAR_STEER_FORWARD_LEVEL, CAR_STEER_REVERSE_LEVEL);
 }
+#endif
 
 static void car_self_test_update(void)
 {
@@ -997,14 +943,12 @@ static void car_reset_runtime_pose_at(float x_m, float y_m, float yaw_deg, uint8
     car_drive_direction = 0;
     car_track_correction_active = 0;
     car_pid_clear(&steer_pos_pid);
-    car_pid_clear(&speed_pid);
     car_pid_clear(&track_pid);
     rear_pwm_ramped = 0;
     gps_priority_stop_count = 0;
     gps_stop_last_fix = car_gps_fix_count;
-    guide_active_direction = 0;
-    guide_pending_direction = 0;
-    guide_direction_hold_count = 0;
+    finish_endpoint_fix_count = 0;
+    finish_last_fix = car_gps_fix_count;
     if(reset_steer)
     {
         car_steer_encoder_count = 0;
@@ -1012,14 +956,9 @@ static void car_reset_runtime_pose_at(float x_m, float y_m, float yaw_deg, uint8
     }
 }
 
-static void car_reset_runtime_pose(void)
-{
-    car_reset_runtime_pose_at(0.0f, 0.0f, 0.0f, 1);
-}
-
 static void car_start_recording(void)
 {
-    if(!car_gps_valid)
+    if(!car_gps_valid || (gps_valid_fix_streak < CAR_GPS_READY_FIX_COUNT))
     {
         car_error_code = CAR_ERROR_GPS_LOST;
         car_all_motor_stop();
@@ -1032,6 +971,7 @@ static void car_start_recording(void)
     car_path_count = 0;
     car_path_duration_ms = 0;
     car_path_has_gps = 1;
+    car_path_prepared = 0;
     car_replay_avg_speed_mps = CAR_LOW_SPEED_MPS;
     car_fixed_rear_pwm = CAR_LOW_SPEED_REAR_PWM;
     last_record_ms = 0;
@@ -1067,7 +1007,8 @@ static void car_start_guide(car_replay_mode_enum mode)
     float start_distance_m;
     uint32 start_index;
 
-    if((car_path_count >= CAR_START_MIN_POINTS) && car_gps_valid)
+    if(car_path_prepared && (car_path_count >= CAR_START_MIN_POINTS) && car_gps_valid
+            && (gps_valid_fix_streak >= CAR_GPS_READY_FIX_COUNT))
     {
         start_index = (CAR_REPLAY_B_RETURN == mode) ? (car_path_count - 1) : 0;
         start_dx = car_gps_x_m - car_path[start_index].x;
@@ -1094,14 +1035,13 @@ static void car_start_guide(car_replay_mode_enum mode)
         car_pwm_sim_nearest_index = start_index;
         guide_start_gps_x_m = car_gps_x_m;
         guide_start_gps_y_m = car_gps_y_m;
-        guide_active_direction = 1;
-        guide_pending_direction = 1;
         car_pwm_sim_gps_dir_locked = 0;
         car_state = CAR_STATE_GUIDE;
     }
     else
     {
-        car_error_code = (car_path_count < CAR_START_MIN_POINTS) ? CAR_ERROR_PATH_SHORT : CAR_ERROR_GPS_LOST;
+        car_error_code = (!car_path_prepared || (car_path_count < CAR_START_MIN_POINTS))
+                ? CAR_ERROR_PATH_SHORT : CAR_ERROR_GPS_LOST;
         car_state = CAR_STATE_ERROR;
         car_all_motor_stop();
     }
@@ -1139,15 +1079,19 @@ void car_nav_gnss_poll(void)
         if((nav_uptime_ms - gps_last_update_ms) > CAR_GPS_STALE_MS)
         {
             car_gps_valid = 0;
+            gps_valid_fix_streak = 0;
         }
         return;
     }
 
     gnss_flag = 0;
-    if(0 != gnss_data_parse())
+    (void)gnss_data_parse();
+    // RMC owns latitude/longitude/speed. GGA-only arrivals must not be counted as duplicate position fixes.
+    if(!gnss_rmc_flag)
     {
         return;
     }
+    gnss_rmc_flag = 0;
 
     car_gps_satellites = gnss.satellite_used;
     car_gps_valid = (gnss.state && (gnss.satellite_used >= CAR_GPS_MIN_SATELLITES)) ? 1 : 0;
@@ -1156,7 +1100,12 @@ void car_nav_gnss_poll(void)
 
     if(!car_gps_valid)
     {
+        gps_valid_fix_streak = 0;
         return;
+    }
+    if(gps_valid_fix_streak < CAR_GPS_READY_FIX_COUNT)
+    {
+        gps_valid_fix_streak++;
     }
 
     lat = car_signed_lat(gnss.latitude, gnss.ns);
@@ -1580,7 +1529,8 @@ static uint32 car_find_nearest_index(void)
     uint32 i;
     uint32 begin;
     uint32 end;
-    uint32 best = car_nearest_index;
+    uint32 previous = car_nearest_index;
+    uint32 best;
     float dx;
     float dy;
     float dist2;
@@ -1588,10 +1538,11 @@ static uint32 car_find_nearest_index(void)
     float best_dist2 = 1000000.0f;
     uint8 found = 0;
 
-    if(best >= car_path_count)
+    if(previous >= car_path_count)
     {
-        best = car_replay_is_return() ? (car_path_count - 1) : 0;
+        previous = car_replay_is_return() ? (car_path_count - 1) : 0;
     }
+    best = previous;
     if(car_replay_is_return())
     {
         begin = (best > CAR_NEAREST_SEARCH_AHEAD_PT) ? (best - CAR_NEAREST_SEARCH_AHEAD_PT) : 0;
@@ -1640,10 +1591,10 @@ static uint32 car_find_nearest_index(void)
         }
     }
 
-    if((!car_replay_is_return() && (best < car_nearest_index))
-            || (car_replay_is_return() && (best > car_nearest_index)))
+    if((!car_replay_is_return() && (best < previous))
+            || (car_replay_is_return() && (best > previous)))
     {
-        best = car_nearest_index;
+        best = previous;
         dx = car_path[best].x - car_pose_x_m;
         dy = car_path[best].y - car_pose_y_m;
         best_dist2 = dx * dx + dy * dy;
@@ -1768,6 +1719,7 @@ static uint8 car_guide_should_finish(void)
     float end_dx;
     float end_dy;
     float end_distance_m;
+    uint8 endpoint_index_reached;
 
     end_index = car_replay_endpoint_index();
     end_dx = car_path[end_index].x - car_pose_x_m;
@@ -1781,6 +1733,30 @@ static uint8 car_guide_should_finish(void)
                     || (car_replay_is_return()
                         && (car_nearest_index <= CAR_PATH_FINISH_INDEX_REMAIN)))
                 && (end_distance_m <= CAR_PATH_FINISH_DISTANCE_M))
+        {
+            return 1;
+        }
+
+        endpoint_index_reached = (((!car_replay_is_return())
+                    && (car_nearest_index + CAR_PATH_FINISH_INDEX_STOP >= car_path_count))
+                || (car_replay_is_return()
+                    && (car_nearest_index <= CAR_PATH_FINISH_INDEX_STOP))) ? 1 : 0;
+        if(finish_last_fix != car_gps_fix_count)
+        {
+            finish_last_fix = car_gps_fix_count;
+            if(endpoint_index_reached && (end_distance_m <= CAR_GPS_PRIORITY_STOP_M))
+            {
+                if(finish_endpoint_fix_count < CAR_PATH_FINISH_STOP_FIX_COUNT)
+                {
+                    finish_endpoint_fix_count++;
+                }
+            }
+            else
+            {
+                finish_endpoint_fix_count = 0;
+            }
+        }
+        if(finish_endpoint_fix_count >= CAR_PATH_FINISH_STOP_FIX_COUNT)
         {
             return 1;
         }
@@ -1802,7 +1778,7 @@ static uint8 car_guide_should_finish(void)
                        + CAR_GUIDE_FINISH_MARGIN_MS;
         if(car_elapsed_ms >= finish_time_ms)
         {
-            return 1;
+            return 2;
         }
     }
 
@@ -1893,43 +1869,6 @@ static float car_signed_cross_track(uint32 index)
     return car_limit_f(cte, CAR_GPS_CTE_LIMIT_M);
 }
 
-static float car_pure_pursuit_steer_target(uint32 target_index, int8 direction)
-{
-    float dx;
-    float dy;
-    float distance_m;
-    float target_bearing_deg;
-    float travel_yaw_deg;
-    float alpha_rad;
-    float curvature;
-    float steer_angle_deg;
-
-    if(target_index >= car_path_count)
-    {
-        return 0.0f;
-    }
-
-    dx = car_path[target_index].x - car_pose_x_m;
-    dy = car_path[target_index].y - car_pose_y_m;
-    distance_m = (float)sqrt(dx * dx + dy * dy);
-    if(distance_m < 0.05f)
-    {
-        car_pure_pursuit_curvature = car_path[target_index].curvature;
-        return car_steer_angle_to_count((float)atan((float)direction * CAR_WHEELBASE_M
-                * car_pure_pursuit_curvature) * CAR_RAD_TO_DEG);
-    }
-
-    target_bearing_deg = (float)atan2(dy, dx) * CAR_RAD_TO_DEG;
-    travel_yaw_deg = car_yaw_deg + ((direction < 0) ? 180.0f : 0.0f);
-    alpha_rad = car_wrap_deg(target_bearing_deg - travel_yaw_deg) * CAR_DEG_TO_RAD;
-    curvature = CAR_PURE_PURSUIT_GAIN * 2.0f * (float)sin(alpha_rad) / distance_m;
-    curvature += CAR_PATH_CURVATURE_FF_GAIN * car_path[target_index].curvature;
-    car_pure_pursuit_curvature = curvature;
-
-    steer_angle_deg = (float)atan((float)direction * CAR_WHEELBASE_M * curvature) * CAR_RAD_TO_DEG;
-    return car_steer_angle_to_count(steer_angle_deg);
-}
-
 static int16 car_steer_position_pwm(float target_count)
 {
     float error;
@@ -1952,37 +1891,6 @@ static int16 car_steer_position_pwm(float target_count)
         output = -CAR_STEER_MOVE_MIN_DUTY;
     }
     return car_limit_i16(output, CAR_STEER_PWM_LIMIT);
-}
-
-static int16 car_speed_to_pwm_signed(float target_speed, float current_speed)
-{
-    int32 output;
-    int8 direction = car_speed_sign(target_speed);
-    float target_abs;
-    float current_abs;
-
-    if(0 == direction)
-    {
-        car_pid_clear(&speed_pid);
-        return car_slew_pwm(0);
-    }
-
-    target_abs = car_abs_f(target_speed);
-    current_abs = car_abs_f(current_speed);
-
-    output = (int32)(car_pid_calc(&speed_pid, target_abs, current_abs)
-           + CAR_SPEED_FEEDFORWARD * target_abs);
-    output = car_limit_i16(output, CAR_REAR_DUTY_LIMIT);
-
-    if((output > 0) && (output < CAR_REAR_MIN_MOVE_DUTY))
-    {
-        output = CAR_REAR_MIN_MOVE_DUTY;
-    }
-    if(direction < 0)
-    {
-        output = -output;
-    }
-    return car_slew_pwm((int16)output);
 }
 
 static void car_select_reference(void)
@@ -2045,10 +1953,12 @@ static void car_guide_update(void)
     float steer_target;
     int16 rear_pwm;
     int16 steer_pwm;
+    uint8 finish_reason;
 
     if((car_path_count < CAR_START_MIN_POINTS) || !car_gps_valid)
     {
-        car_error_code = (car_path_count < CAR_START_MIN_POINTS) ? CAR_ERROR_PATH_SHORT : CAR_ERROR_GPS_LOST;
+        car_error_code = (!car_path_prepared || (car_path_count < CAR_START_MIN_POINTS))
+                ? CAR_ERROR_PATH_SHORT : CAR_ERROR_GPS_LOST;
         car_state = CAR_STATE_ERROR;
         car_all_motor_stop();
         return;
@@ -2104,9 +2014,19 @@ static void car_guide_update(void)
     car_motor_set(CAR_RIGHT_MOTOR_PWM_CH, CAR_RIGHT_MOTOR_DIR_PIN, rear_pwm * CAR_RIGHT_MOTOR_DUTY_SIGN, CAR_MOTOR_FORWARD_LEVEL, CAR_MOTOR_REVERSE_LEVEL);
     car_motor_set(CAR_STEER_MOTOR_PWM_CH, CAR_STEER_MOTOR_DIR_PIN, steer_pwm, CAR_STEER_FORWARD_LEVEL, CAR_STEER_REVERSE_LEVEL);
 
-    if(car_guide_should_finish())
+    finish_reason = car_guide_should_finish();
+    if(finish_reason)
     {
-        car_state = CAR_STATE_FINISHED;
+        if(2 == finish_reason)
+        {
+            car_error_code = CAR_ERROR_GUIDE_TIMEOUT;
+            car_state = CAR_STATE_ERROR;
+        }
+        else
+        {
+            car_error_code = CAR_ERROR_NONE;
+            car_state = CAR_STATE_FINISHED;
+        }
         car_all_motor_stop();
     }
 }
@@ -2125,6 +2045,7 @@ void car_nav_control_10ms(void)
     if((nav_uptime_ms - gps_last_update_ms) > CAR_GPS_STALE_MS)
     {
         car_gps_valid = 0;
+        gps_valid_fix_streak = 0;
     }
     car_key1_level = gpio_get_level(CAR_KEY_A_PIN);
     car_key2_level = gpio_get_level(CAR_KEY_B_PIN);
@@ -2208,6 +2129,7 @@ void car_nav_control_10ms(void)
             car_path_count = 0;
             car_path_duration_ms = 0;
             car_path_has_gps = 0;
+            car_path_prepared = 0;
             car_replay_mode = CAR_REPLAY_NONE;
             car_error_code = CAR_ERROR_NONE;
             car_state = CAR_STATE_WAIT_START;
@@ -2244,8 +2166,18 @@ void car_nav_control_10ms(void)
         {
             car_error_code = CAR_ERROR_NONE;
             car_replay_mode = CAR_REPLAY_NONE;
-            car_state = (car_path_count >= CAR_START_MIN_POINTS)
-                    ? CAR_STATE_READY : CAR_STATE_WAIT_START;
+            if(car_path_prepared && (car_path_count >= CAR_START_MIN_POINTS))
+            {
+                car_state = CAR_STATE_READY;
+            }
+            else
+            {
+                car_path_count = 0;
+                car_path_duration_ms = 0;
+                car_path_has_gps = 0;
+                car_path_prepared = 0;
+                car_state = CAR_STATE_WAIT_START;
+            }
         }
         return;
     }
@@ -2262,10 +2194,12 @@ void car_nav_background(void)
         {
             car_error_code = CAR_ERROR_NONE;
             car_replay_mode = CAR_REPLAY_NONE;
+            car_path_prepared = 1;
             car_state = CAR_STATE_READY;
         }
         else
         {
+            car_path_prepared = 0;
             car_error_code = CAR_ERROR_PATH_SHORT;
             car_state = CAR_STATE_ERROR;
         }

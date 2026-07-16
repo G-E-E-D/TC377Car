@@ -111,8 +111,8 @@
 
 #define UART3_INT_SERVICE       IfxSrc_Tos_cpu0
 #define UART3_TX_INT_PRIO       19
-#define UART3_RX_INT_PRIO       20
-#define UART3_ER_INT_PRIO       21
+#define UART3_RX_INT_PRIO       55                  // GNSS RX must pre-empt the 10ms navigation ISR (priority 50).
+#define UART3_ER_INT_PRIO       56
 
 #define UART4_INT_SERVICE       IfxSrc_Tos_cpu0
 #define UART4_TX_INT_PRIO       22

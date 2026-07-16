@@ -38,7 +38,7 @@
 *                   模块管脚            单片机管脚
 *                   RX                  查看 zf_device_gnss.h 中 GNSS_RX 宏定义
 *                   TX                  查看 zf_device_gnss.h 中 GNSS_TX 宏定义
-*                   VCC                 3.3V电源
+*                   VCC                 5V电源（TAU1201逐飞双频模块板载LDO，串口电平仍为3.3V）
 *                   GND                 电源地
 *                   ------------------------------------
 ********************************************************************************************************************/
@@ -113,7 +113,8 @@ typedef enum
 }gps_state_enum;
 
 extern gnss_info_struct gnss;
-extern uint8            gnss_flag;
+extern volatile uint8   gnss_flag;
+extern volatile uint8   gnss_rmc_flag;
 
 
 double      get_two_points_distance     (double lat1, double lng1, double lat2, double lng2);
