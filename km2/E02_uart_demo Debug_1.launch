@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<launchConfiguration type="com.rt.hightec.agent.launcher.launchConfigurationType">
+    <stringAttribute key="ACC_HW" value="DAS JDS TriBoard TC3XX V2.0 TB9L1S65"/>
+    <booleanAttribute key="ENABLE_AGENTLOG" value="false"/>
+    <booleanAttribute key="ENABLE_FLASHING" value="true"/>
+    <booleanAttribute key="ENABLE_STOPPING" value="true"/>
+    <stringAttribute key="EXECUTABLE_PATH" value="${project_loc}/Debug/E02_uart_demo.elf"/>
+    <stringAttribute key="STOP_FUNCTION" value="core0_main"/>
+    <stringAttribute key="SVD" value="D:/AURIX_DS/AURIX-Studio-1.10.32/build_system/bundled-artefacts-repo/svd/tc37xpd/1.2-3/device.svd"/>
+    <stringAttribute key="org.eclipse.cdt.launch.PROJECT_ATTR" value="E02_uart_demo"/>
+    <listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_PATHS">
+        <listEntry value="/E02_uart_demo"/>
+    </listAttribute>
+    <listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_TYPES">
+        <listEntry value="4"/>
+    </listAttribute>
+    <stringAttribute key="org.eclipse.debug.ui.ATTR_LOCATION" value="/E02_uart_demo/E02_uart_demo Debug_1.launch"/>
+    <stringAttribute key="org.eclipse.debug.ui.ATTR_PROJECT_NAME" value="E02_uart_demo"/>
+    <booleanAttribute key="org.eclipse.debug.ui.ATTR_SHARED" value="true"/>
+    <stringAttribute key="org.eclipse.tcf.debug.MemoryMap" value="[{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 2: CPU2 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;6aa75e8b-561d-454b-b10b-08b89b4c2b98&quot;},{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 2: CPU2 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;9328f240-134d-451b-a186-f423c998468b&quot;},{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 2: CPU2 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;85c017d2-28bb-49d4-bd8f-687e852d10a1&quot;},{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 0: CPU0 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;71d38de0-14ea-4c07-a855-00697e3fd34f&quot;},{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 2: CPU2 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;62f5cdba-a560-47ce-b65b-c71d6fb61a04&quot;},{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 0: CPU0 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;61e1f655-1d9e-4487-b7d3-80c761cf495f&quot;},{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 2: CPU2 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;209acdc0-6ef7-462b-a9b8-307426f469d1&quot;},{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 0: CPU0 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;ddfd0d8b-12a2-4628-881f-66d45a3d5204&quot;},{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 1: CPU1 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;6f7072a3-818f-4b2f-9750-f3e0ff9ae153&quot;},{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 2: CPU2 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;24b981c3-c918-4dff-a00a-94ec5b0b73ba&quot;},{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 0: CPU0 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;bfd4e69b-8cd3-4c3c-8d97-005f6bff3156&quot;},{&quot;FileName&quot;:&quot;D:/CardingCode/km2/Debug/E02_uart_demo.elf&quot;,&quot;ID&quot;:&quot;/DAS JDS TriBoard TC3XX V2.0 TB9L1S65/Core 1: CPU1 TriCore 1.6P&quot;,&quot;Flags&quot;:0,&quot;UUID&quot;:&quot;12f242a8-e978-49ad-8a83-8ed40f02c054&quot;}]"/>
+    <stringAttribute key="org.eclipse.tcf.debug.PeerID" value="TCP:127.0.0.1:1534"/>
+    <stringAttribute key="org.eclipse.tcf.debug.ProjectName" value="E02_uart_demo"/>
+    <booleanAttribute key="org.eclipse.tcf.debug.RunLocalAgent" value="false"/>
+    <booleanAttribute key="org.eclipse.tcf.debug.RunLocalServer" value="false"/>
+    <booleanAttribute key="org.eclipse.tcf.debug.UseLocalAgent" value="false"/>
+    <stringAttribute key="org.eclipse.tcf.debug.executable_name" value="${project_loc}/Debug/E02_uart_demo.elf"/>
+    <stringAttribute key="sessionID" value="f1b76bd3-a800-48d9-8c7b-d9c333f88db4"/>
+</launchConfiguration>
