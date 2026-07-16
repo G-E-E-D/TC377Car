@@ -1,5 +1,19 @@
 #include "car_nav.h"
+#include <float.h>
+#include <limits.h>
 #include <math.h>
+
+/*
+ * 本文件的导航流程（2026-07-16 G版）：
+ * 1. 开机静止采集场地本地基准，并用GGA质量、HDOP和新鲜度门控；
+ * 2. A键教学时，以GPS位置为主、前轮编码器和IMU作短时传播，固定低PWM行驶；
+ * 3. 教学结束后进行等弧长插值、空间平滑和首末端稳健航向计算；
+ * 4. READY状态下A/B先选路线并校验位置/车头方向，再按同一按键确认启动；
+ * 5. 复跑时误差在死区内只复现教学前馈，越界后PID纠偏至恢复阈值；
+ * 6. GPS跳点、EKF失锁、编码器异常、车辆无进度或控制超时都会锁止电机。
+ *
+ * 注意：轴距、轮角映射、机械中位、天线杆臂和真实车速仍必须用实车标定。
+ */
 
 #pragma section all "cpu0_dsram"
 
@@ -92,11 +106,23 @@ static uint8 local_datum_consecutive_rejects = 0;
 #endif
 static float gps_filter_x[CAR_GPS_FILTER_WINDOW] = {0.0f};
 static float gps_filter_y[CAR_GPS_FILTER_WINDOW] = {0.0f};
+static float gps_filter_output_x = 0.0f;
+static float gps_filter_output_y = 0.0f;
 static uint8 gps_filter_count = 0;
 static uint8 gps_filter_index = 0;
+static volatile uint8 gps_filter_reset_requested = 0;
+// GPS发布采用奇偶序列锁：偶数表示快照完整，奇数表示主循环正在写入。
 static volatile uint8 gps_valid_fix_streak = 0;
 static volatile uint32 gps_last_update_ms = 0;
 static volatile uint32 nav_uptime_ms = 0;
+static uint32 gps_seen_gga_count = 0;
+static uint32 gps_last_gga_ms = 0;
+static uint8 gps_gga_seen = 0;
+static volatile uint32 gps_publish_sequence = 0;
+static float gps_last_raw_x = 0.0f;
+static float gps_last_raw_y = 0.0f;
+static uint32 gps_last_raw_ms = 0;
+static uint8 gps_raw_initialized = 0;
 static uint32 gps_stop_last_fix = 0;
 static uint32 last_record_ms = 0;
 static float last_record_x = 0.0f;
@@ -112,14 +138,43 @@ static volatile float gps_pending_x_m = 0.0f;
 static volatile float gps_pending_y_m = 0.0f;
 static volatile float gps_pending_speed_mps = 0.0f;
 static volatile float gps_pending_yaw_deg = 0.0f;
+static volatile float gps_pending_heading_yaw_deg = 0.0f;
+static volatile uint8 gps_pending_heading_valid = 0;
+static uint8 ekf_pos_reject_count = 0;
+// 单天线GPS静止时没有绝对航向；移动够0.5m后才把位移方向作为可靠航向观测。
+static uint8 ekf_yaw_observed = 0;
+static float gps_heading_anchor_x = 0.0f;
+static float gps_heading_anchor_y = 0.0f;
+static uint8 gps_heading_anchor_initialized = 0;
+static volatile uint8 gps_heading_reset_requested = 0;
 static float guide_start_gps_x_m = 0.0f;
 static float guide_start_gps_y_m = 0.0f;
+static float guide_progress_anchor_s_m = 0.0f;
+static uint32 guide_progress_last_ms = 0;
 static uint32 self_test_step_start_ms = 0;
 static uint8 self_test_settle_count = 0;
 static uint16 gps_priority_stop_count = 0;
 static volatile uint8 car_path_prepared = 0;
 static uint8 finish_endpoint_fix_count = 0;
 static uint32 finish_last_fix = 0;
+static uint16 steer_stall_count = 0;
+static uint8 steer_wrong_direction_count = 0;
+static uint8 key_last_a_level = CAR_KEY_RELEASE_LEVEL;
+static uint8 key_last_b_level = CAR_KEY_RELEASE_LEVEL;
+static uint8 key_a_cooldown = 0;
+static uint8 key_b_cooldown = 0;
+static uint8 ready_pending_key = 0;
+static uint8 ready_pending_count = 0;
+static uint8 ready_chord_count = 0;
+static uint8 ready_wait_release = 0;
+#if !CAR_LOCAL_DATUM_FIXED_ENABLE
+static double local_datum_first_lat = 0.0;
+static double local_datum_first_lon = 0.0;
+static double local_datum_second_lat = 0.0;
+static double local_datum_second_lon = 0.0;
+static uint16 local_datum_first_count = 0;
+static uint16 local_datum_second_count = 0;
+#endif
 
 static car_pid_struct steer_pos_pid = {
         CAR_STEER_POS_KP, CAR_STEER_POS_KI, CAR_STEER_POS_KD,
@@ -138,6 +193,18 @@ static void car_path_calc_fixed_rear_pwm(void);
 static void car_gps_filter_reset(void);
 #endif
 static void car_path_prepare(void);
+static void car_store_path_point(uint32 index);
+
+// 不依赖平台isfinite宏，避免不同TASKING数学库配置导致编译差异。
+static uint8 car_float_is_finite(float value)
+{
+    return ((value == value) && (value <= FLT_MAX) && (value >= -FLT_MAX)) ? 1 : 0;
+}
+
+static uint8 car_double_is_finite(double value)
+{
+    return ((value == value) && (value <= DBL_MAX) && (value >= -DBL_MAX)) ? 1 : 0;
+}
 
 static float car_abs_f(float value)
 {
@@ -160,15 +227,33 @@ static int16 car_limit_i16(int32 value, int16 limit)
 
 static float car_wrap_deg(float angle)
 {
-    while(angle > 180.0f)  angle -= 360.0f;
-    while(angle < -180.0f) angle += 360.0f;
+    if(!car_float_is_finite(angle))
+    {
+        return angle;
+    }
+    if((angle <= 180.0f) && (angle >= -180.0f))
+    {
+        return angle;
+    }
+    // 非正常大角度只做一次取模，避免while遇到Inf时卡死控制中断。
+    angle = (float)fmod(angle, 360.0);
+    if(angle > 180.0f)  angle -= 360.0f;
+    if(angle < -180.0f) angle += 360.0f;
     return angle;
 }
 
 static float car_angle_to_360(float angle)
 {
-    while(angle >= 360.0f) angle -= 360.0f;
-    while(angle < 0.0f)    angle += 360.0f;
+    if(!car_float_is_finite(angle))
+    {
+        return angle;
+    }
+    if((angle >= 0.0f) && (angle < 360.0f))
+    {
+        return angle;
+    }
+    angle = (float)fmod(angle, 360.0);
+    if(angle < 0.0f) angle += 360.0f;
     return angle;
 }
 
@@ -219,6 +304,15 @@ static void car_gps_filter_reset(void)
     }
     gps_filter_count = 0;
     gps_filter_index = 0;
+    gps_filter_reset_requested = 0;
+    gps_filter_output_x = 0.0f;
+    gps_filter_output_y = 0.0f;
+    gps_raw_initialized = 0;
+    gps_heading_anchor_initialized = 0;
+    gps_heading_reset_requested = 0;
+    gps_last_raw_x = 0.0f;
+    gps_last_raw_y = 0.0f;
+    gps_last_raw_ms = nav_uptime_ms;
     car_gps_x_m = 0.0f;
     car_gps_y_m = 0.0f;
 }
@@ -249,7 +343,7 @@ static float car_gps_median(const float *samples, uint8 count)
     return temp[count / 2];
 }
 
-static void car_gps_filter_update(float raw_x, float raw_y)
+static void car_gps_filter_update(float raw_x, float raw_y, float *filtered_x, float *filtered_y)
 {
     float median_x;
     float median_y;
@@ -270,14 +364,16 @@ static void car_gps_filter_update(float raw_x, float raw_y)
     median_y = car_gps_median(gps_filter_y, gps_filter_count);
     if(1 == gps_filter_count)
     {
-        car_gps_x_m = median_x;
-        car_gps_y_m = median_y;
+        gps_filter_output_x = median_x;
+        gps_filter_output_y = median_y;
     }
     else
     {
-        car_gps_x_m += (median_x - car_gps_x_m) * CAR_GPS_FILTER_ALPHA;
-        car_gps_y_m += (median_y - car_gps_y_m) * CAR_GPS_FILTER_ALPHA;
+        gps_filter_output_x += (median_x - gps_filter_output_x) * CAR_GPS_FILTER_ALPHA;
+        gps_filter_output_y += (median_y - gps_filter_output_y) * CAR_GPS_FILTER_ALPHA;
     }
+    *filtered_x = gps_filter_output_x;
+    *filtered_y = gps_filter_output_y;
 }
 
 static int8 car_speed_sign(float speed)
@@ -397,18 +493,28 @@ static void car_pwm_sim_try_lock_gps_direction(void)
 
 float car_pid_calc(car_pid_struct *pid, float target, float current)
 {
+    float previous_integral;
+    float raw_output;
     float output;
 
     pid->error = target - current;
+    previous_integral = pid->integral;
     pid->integral += pid->error;
     pid->integral = car_limit_f(pid->integral, pid->integral_limit);
 
-    output = pid->kp * pid->error
+    raw_output = pid->kp * pid->error
            + pid->ki * pid->integral
            + pid->kd * (pid->error - pid->last_error);
     pid->last_error = pid->error;
 
-    return car_limit_f(output, pid->output_limit);
+    if(((raw_output > pid->output_limit) && (pid->error > 0.0f))
+            || ((raw_output < -pid->output_limit) && (pid->error < 0.0f)))
+    {
+        pid->integral = previous_integral;
+    }
+    output = car_limit_f(raw_output, pid->output_limit);
+
+    return output;
 }
 
 static void car_pid_clear(car_pid_struct *pid)
@@ -456,6 +562,39 @@ static void car_ekf_sync_outputs(void)
     car_speed_mps = car_limit_f(ekf_state[CAR_EKF_SPEED], CAR_IMU_SPEED_LIMIT_MPS);
 }
 
+static uint8 car_ekf_numeric_ok(void)
+{
+    // 每个控制周期检查状态和协方差，NaN/Inf不能继续流入PID或浮点转整数。
+    uint8 i;
+    uint8 j;
+
+    for(i = 0; i < CAR_EKF_STATE_DIM; i++)
+    {
+        if(!car_float_is_finite(ekf_state[i])
+                || !car_float_is_finite(ekf_p[i][i])
+                || (ekf_p[i][i] < 0.0f))
+        {
+            return 0;
+        }
+        for(j = 0; j < CAR_EKF_STATE_DIM; j++)
+        {
+            if(!car_float_is_finite(ekf_p[i][j]))
+            {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static void car_fault_stop(uint8 error_code)
+{
+    // 所有软件检测到的致命故障统一走这里，保证先锁状态再把三个PWM清零。
+    car_error_code = error_code;
+    car_state = CAR_STATE_ERROR;
+    car_all_motor_stop();
+}
+
 static void car_ekf_init_state(float x, float y, float yaw_deg, float speed_mps)
 {
     uint8 i;
@@ -488,6 +627,7 @@ static void car_ekf_init_state(float x, float y, float yaw_deg, float speed_mps)
     car_ekf_speed_residual_mps = 0.0f;
     car_ekf_yaw_residual_deg = 0.0f;
     car_ekf_gps_update_count = 0;
+    ekf_yaw_observed = 0;
     car_ekf_sync_outputs();
 }
 
@@ -594,7 +734,8 @@ static void car_ekf_predict(float gyro_dps, float acc_mps2)
     {
         for(j = 0; j < CAR_EKF_STATE_DIM; j++)
         {
-            ekf_p[i][j] = p_new[i][j];
+            // Explicit symmetry prevents long float runs from accumulating a skewed covariance.
+            ekf_p[i][j] = 0.5f * (p_new[i][j] + p_new[j][i]);
         }
         ekf_p[i][i] += q[i];
         if(ekf_p[i][i] < CAR_EKF_MIN_COV)
@@ -615,12 +756,11 @@ static void car_ekf_update_scalar(const float h[CAR_EKF_STATE_DIM], float innova
 #if CAR_EKF_ENABLE
     uint8 i;
     uint8 j;
-    uint8 k;
     float s = r;
     float ph[CAR_EKF_STATE_DIM] = {0.0f};
     float gain[CAR_EKF_STATE_DIM];
     float p_old[CAR_EKF_STATE_DIM][CAR_EKF_STATE_DIM];
-    float hp;
+    float value;
 
     for(i = 0; i < CAR_EKF_STATE_DIM; i++)
     {
@@ -649,17 +789,23 @@ static void car_ekf_update_scalar(const float h[CAR_EKF_STATE_DIM], float innova
     {
         for(j = 0; j < CAR_EKF_STATE_DIM; j++)
         {
-            hp = 0.0f;
-            for(k = 0; k < CAR_EKF_STATE_DIM; k++)
-            {
-                hp += h[k] * p_old[k][j];
-            }
-            ekf_p[i][j] = p_old[i][j] - gain[i] * hp;
+            // Joseph形式：(I-KH)P(I-KH)' + KRK'，比简化式更不易破坏半正定性。
+            value = p_old[i][j]
+                  - gain[i] * ph[j]
+                  - ph[i] * gain[j]
+                  + gain[i] * s * gain[j];
+            ekf_p[i][j] = value;
         }
     }
 
     for(i = 0; i < CAR_EKF_STATE_DIM; i++)
     {
+        for(j = i + 1; j < CAR_EKF_STATE_DIM; j++)
+        {
+            value = 0.5f * (ekf_p[i][j] + ekf_p[j][i]);
+            ekf_p[i][j] = value;
+            ekf_p[j][i] = value;
+        }
         if(ekf_p[i][i] < CAR_EKF_MIN_COV)
         {
             ekf_p[i][i] = CAR_EKF_MIN_COV;
@@ -674,25 +820,96 @@ static void car_ekf_update_scalar(const float h[CAR_EKF_STATE_DIM], float innova
 #endif
 }
 
-static void car_ekf_update_gps(float gps_x, float gps_y, float gps_speed_mps, float gps_yaw_deg)
+static void car_gps_measurement_to_reference(float antenna_x, float antenna_y,
+        float speed_mps, float travel_yaw_deg, float body_yaw_deg,
+        float *reference_x, float *reference_y)
+{
+    float travel_yaw_rad = travel_yaw_deg * CAR_DEG_TO_RAD;
+    float body_yaw_rad = body_yaw_deg * CAR_DEG_TO_RAD;
+    float projected_x = antenna_x;
+    float projected_y = antenna_y;
+
+    if(!car_float_is_finite(body_yaw_rad))
+    {
+        body_yaw_rad = travel_yaw_rad;
+    }
+
+    if(car_float_is_finite(speed_mps) && car_float_is_finite(travel_yaw_rad))
+    {
+        // Compensate the bounded median/IIR delay before comparing REC and A/B in opposite directions.
+        projected_x += speed_mps * CAR_GPS_FILTER_DELAY_S * (float)cos(travel_yaw_rad);
+        projected_y += speed_mps * CAR_GPS_FILTER_DELAY_S * (float)sin(travel_yaw_rad);
+    }
+
+    // 把天线坐标换算到后轴/车体参考点；偏置默认0，实测后再填写配置。
+    *reference_x = projected_x
+            - (float)cos(body_yaw_rad) * CAR_GPS_ANTENNA_FORWARD_M
+            + (float)sin(body_yaw_rad) * CAR_GPS_ANTENNA_LEFT_M;
+    *reference_y = projected_y
+            - (float)sin(body_yaw_rad) * CAR_GPS_ANTENNA_FORWARD_M
+            - (float)cos(body_yaw_rad) * CAR_GPS_ANTENNA_LEFT_M;
+}
+
+static void car_ekf_update_gps(float gps_x, float gps_y, float gps_speed_mps,
+        float gps_course_yaw_deg, float gps_heading_yaw_deg, uint8 gps_heading_valid)
 {
 #if CAR_EKF_ENABLE
     float h[CAR_EKF_STATE_DIM] = {0.0f};
-    float dx = gps_x - ekf_state[CAR_EKF_X];
-    float dy = gps_y - ekf_state[CAR_EKF_Y];
+    float reference_x;
+    float reference_y;
+    float dx;
+    float dy;
     float gps_signed_speed;
     float yaw_innovation;
+    float yaw_measurement_deg;
+    uint8 i;
     int8 direction;
 
+    car_gps_measurement_to_reference(gps_x, gps_y, gps_speed_mps,
+            gps_course_yaw_deg, ekf_state[CAR_EKF_YAW] * CAR_RAD_TO_DEG,
+            &reference_x, &reference_y);
+    dx = reference_x - ekf_state[CAR_EKF_X];
+    dy = reference_y - ekf_state[CAR_EKF_Y];
     car_ekf_pos_residual_m = (float)sqrt(dx * dx + dy * dy);
-    if(car_ekf_pos_residual_m < CAR_EKF_GPS_POS_GATE_M)
+    if(car_ekf_pos_residual_m <= CAR_EKF_GPS_POS_GATE_M)
     {
+        ekf_pos_reject_count = 0;
         h[CAR_EKF_X] = 1.0f;
         car_ekf_update_scalar(h, dx, CAR_EKF_R_GPS_POS);
 
         h[CAR_EKF_X] = 0.0f;
         h[CAR_EKF_Y] = 1.0f;
-        car_ekf_update_scalar(h, gps_y - ekf_state[CAR_EKF_Y], CAR_EKF_R_GPS_POS);
+        car_ekf_update_scalar(h, reference_y - ekf_state[CAR_EKF_Y], CAR_EKF_R_GPS_POS);
+    }
+    else
+    {
+        if(ekf_pos_reject_count < CAR_EKF_POS_REJECT_STOP_COUNT)
+        {
+            ekf_pos_reject_count++;
+        }
+        if(ekf_pos_reject_count >= CAR_EKF_POS_REJECT_STOP_COUNT)
+        {
+            if((CAR_STATE_RECORDING == car_state) || (CAR_STATE_GUIDE == car_state))
+            {
+                car_error_code = CAR_ERROR_EKF_REJECT;
+                car_state = CAR_STATE_ERROR;
+            }
+            else
+            {
+                ekf_state[CAR_EKF_X] = reference_x;
+                ekf_state[CAR_EKF_Y] = reference_y;
+                for(i = 0; i < CAR_EKF_STATE_DIM; i++)
+                {
+                    ekf_p[CAR_EKF_X][i] = 0.0f;
+                    ekf_p[i][CAR_EKF_X] = 0.0f;
+                    ekf_p[CAR_EKF_Y][i] = 0.0f;
+                    ekf_p[i][CAR_EKF_Y] = 0.0f;
+                }
+                ekf_p[CAR_EKF_X][CAR_EKF_X] = CAR_EKF_R_GPS_POS;
+                ekf_p[CAR_EKF_Y][CAR_EKF_Y] = CAR_EKF_R_GPS_POS;
+                ekf_pos_reject_count = 0;
+            }
+        }
     }
 
     direction = car_speed_sign(ekf_state[CAR_EKF_SPEED]);
@@ -702,18 +919,42 @@ static void car_ekf_update_gps(float gps_x, float gps_y, float gps_speed_mps, fl
     }
     gps_signed_speed = gps_speed_mps * (float)direction;
     car_ekf_speed_residual_mps = gps_signed_speed - ekf_state[CAR_EKF_SPEED];
-    h[CAR_EKF_Y] = 0.0f;
-    h[CAR_EKF_SPEED] = 1.0f;
-    car_ekf_update_scalar(h, car_ekf_speed_residual_mps, CAR_EKF_R_GPS_SPEED);
-
-    if((CAR_STATE_RECORDING != car_state)
-            && (gps_speed_mps > (CAR_GPS_YAW_MIN_SPEED_KMH / 3.6f)))
+    if(car_abs_f(car_ekf_speed_residual_mps) <= CAR_EKF_GPS_SPEED_GATE_MPS)
     {
+        h[CAR_EKF_Y] = 0.0f;
+        h[CAR_EKF_SPEED] = 1.0f;
+        car_ekf_update_scalar(h, car_ekf_speed_residual_mps, CAR_EKF_R_GPS_SPEED);
+    }
+
+    if(gps_heading_valid
+            || ((CAR_STATE_RECORDING != car_state)
+                && (gps_speed_mps > (CAR_GPS_YAW_MIN_SPEED_KMH / 3.6f))))
+    {
+        yaw_measurement_deg = gps_heading_valid ? gps_heading_yaw_deg : gps_course_yaw_deg;
+
+        if(gps_heading_valid && !ekf_yaw_observed)
+        {
+            // A 0.5m displacement is the first observable absolute yaw for a
+            // single-antenna receiver at standstill/low speed.
+            ekf_state[CAR_EKF_YAW] = yaw_measurement_deg * CAR_DEG_TO_RAD;
+            for(i = 0; i < CAR_EKF_STATE_DIM; i++)
+            {
+                ekf_p[CAR_EKF_YAW][i] = 0.0f;
+                ekf_p[i][CAR_EKF_YAW] = 0.0f;
+            }
+            ekf_p[CAR_EKF_YAW][CAR_EKF_YAW] = CAR_EKF_R_GPS_YAW_RAD;
+            ekf_yaw_observed = 1;
+            car_ekf_sync_outputs();
+        }
         h[CAR_EKF_SPEED] = 0.0f;
         h[CAR_EKF_YAW] = 1.0f;
-        yaw_innovation = car_wrap_deg(gps_yaw_deg - ekf_state[CAR_EKF_YAW] * CAR_RAD_TO_DEG) * CAR_DEG_TO_RAD;
+        yaw_innovation = car_wrap_deg(yaw_measurement_deg
+                - ekf_state[CAR_EKF_YAW] * CAR_RAD_TO_DEG) * CAR_DEG_TO_RAD;
         car_ekf_yaw_residual_deg = yaw_innovation * CAR_RAD_TO_DEG;
-        car_ekf_update_scalar(h, yaw_innovation, CAR_EKF_R_GPS_YAW_RAD);
+        if(car_abs_f(car_ekf_yaw_residual_deg) <= CAR_EKF_GPS_YAW_GATE_DEG)
+        {
+            car_ekf_update_scalar(h, yaw_innovation, CAR_EKF_R_GPS_YAW_RAD);
+        }
     }
 
     car_ekf_gps_update_count++;
@@ -721,7 +962,9 @@ static void car_ekf_update_gps(float gps_x, float gps_y, float gps_speed_mps, fl
     (void)gps_x;
     (void)gps_y;
     (void)gps_speed_mps;
-    (void)gps_yaw_deg;
+    (void)gps_course_yaw_deg;
+    (void)gps_heading_yaw_deg;
+    (void)gps_heading_valid;
 #endif
 }
 
@@ -737,22 +980,49 @@ static void car_ekf_update_still(void)
 
 static void car_ekf_apply_pending_gps(void)
 {
+    uint32 sequence_before;
+    uint32 sequence_after;
     float gps_x;
     float gps_y;
     float gps_speed;
     float gps_yaw;
+    float gps_heading_yaw;
+    uint8 gps_heading_valid;
+    float reference_x;
+    float reference_y;
 
     if(!gps_update_pending)
     {
         return;
     }
 
+    // ISR若撞上主循环写快照（奇数序号），本周期跳过，下个10ms再读取完整数据。
+    sequence_before = gps_publish_sequence;
+    if(sequence_before & 1U)
+    {
+        return;
+    }
     gps_x = gps_pending_x_m;
     gps_y = gps_pending_y_m;
     gps_speed = gps_pending_speed_mps;
     gps_yaw = gps_pending_yaw_deg;
+    gps_heading_yaw = gps_pending_heading_yaw_deg;
+    gps_heading_valid = gps_pending_heading_valid;
+    sequence_after = gps_publish_sequence;
+    if((sequence_before != sequence_after) || (sequence_after & 1U))
+    {
+        return;
+    }
     gps_update_pending = 0;
-    car_ekf_update_gps(gps_x, gps_y, gps_speed, gps_yaw);
+    car_gps_measurement_to_reference(gps_x, gps_y, gps_speed, gps_yaw, car_yaw_deg,
+            &reference_x, &reference_y);
+    car_gps_x_m = reference_x;
+    car_gps_y_m = reference_y;
+    car_gps_speed_mps = gps_speed;
+    car_gps_direction_deg = gps_yaw;
+    car_gps_fix_count++;
+    car_ekf_update_gps(gps_x, gps_y, gps_speed, gps_yaw,
+            gps_heading_yaw, gps_heading_valid);
 }
 
 void car_all_motor_stop(void)
@@ -940,6 +1210,8 @@ static void car_reset_runtime_pose_at(float x_m, float y_m, float yaw_deg, uint8
     car_elapsed_ms = 0;
     car_ekf_init_state(x_m, y_m, yaw_deg, 0.0f);
     gps_update_pending = 0;
+    // 新一段REC/GUIDE必须从当前位置重新累计0.5m航向基线，不能沿用搬车阶段的锚点。
+    gps_heading_reset_requested = 1;
     car_acc_forward_mps2 = 0.0f;
     car_record_s_m = 0.0f;
     car_replay_s_m = 0.0f;
@@ -965,6 +1237,9 @@ static void car_reset_runtime_pose_at(float x_m, float y_m, float yaw_deg, uint8
     gps_stop_last_fix = car_gps_fix_count;
     finish_endpoint_fix_count = 0;
     finish_last_fix = car_gps_fix_count;
+    ekf_pos_reject_count = 0;
+    steer_stall_count = 0;
+    steer_wrong_direction_count = 0;
     if(reset_steer)
     {
         car_steer_encoder_count = 0;
@@ -986,10 +1261,21 @@ static void car_start_recording(void)
         car_all_motor_stop();
         return;
     }
+    if((car_steer_encoder_count > CAR_RECORD_START_STEER_CENTER_TOL_CNT)
+            || (car_steer_encoder_count < -CAR_RECORD_START_STEER_CENTER_TOL_CNT))
+    {
+        car_error_code = CAR_ERROR_STEER_NOT_CENTERED;
+        car_all_motor_stop();
+        return;
+    }
 
+    // 增量编码器没有绝对中位传感器：只允许靠近“上电机械中位”时开始教学，
+    // 并且此处不再把任意当前轮角强行清零。
     car_error_code = CAR_ERROR_NONE;
     car_replay_mode = CAR_REPLAY_NONE;
-    car_reset_runtime_pose_at(car_gps_x_m, car_gps_y_m, car_yaw_deg, 1);
+    // The incremental encoder zero belongs to the power-on mechanical-centre procedure,
+    // not to an arbitrary wheel angle when the operator presses REC.
+    car_reset_runtime_pose_at(car_gps_x_m, car_gps_y_m, car_yaw_deg, 0);
     car_path_count = 0;
     car_path_duration_ms = 0;
     car_path_has_gps = 1;
@@ -1000,14 +1286,43 @@ static void car_start_recording(void)
     last_record_x = car_pose_x_m;
     last_record_y = car_pose_y_m;
     last_record_yaw_deg = car_yaw_deg;
-    last_record_steer_count = 0.0f;
+    last_record_steer_count = (float)car_steer_encoder_count;
     car_state = CAR_STATE_RECORDING;
     car_all_motor_stop();
 }
 
 static void car_finish_recording(void)
 {
+    float dx;
+    float dy;
+    float distance_m;
+
     car_all_motor_stop();
+    // Capture the pose at the stop command. Without this, the endpoint can be one
+    // record interval behind and its one-sided heading becomes disproportionately noisy.
+    if(car_gps_valid)
+    {
+        if(0 == car_path_count)
+        {
+            car_store_path_point(0);
+            car_path_count = 1;
+        }
+        else
+        {
+            dx = car_pose_x_m - car_path[car_path_count - 1].x;
+            dy = car_pose_y_m - car_path[car_path_count - 1].y;
+            distance_m = (float)sqrt(dx * dx + dy * dy);
+            if((distance_m > 0.001f) && (car_path_count < CAR_PATH_MAX_POINTS))
+            {
+                car_store_path_point(car_path_count);
+                car_path_count++;
+            }
+            else
+            {
+                car_store_path_point(car_path_count - 1);
+            }
+        }
+    }
     if(car_path_count >= CAR_START_MIN_POINTS)
     {
         car_path_duration_ms = car_path[car_path_count - 1].time_ms;
@@ -1021,33 +1336,85 @@ static void car_finish_recording(void)
     }
 }
 
-static void car_start_guide(car_replay_mode_enum mode)
+static uint8 car_guide_precheck(car_replay_mode_enum mode, float *start_yaw_deg)
 {
-    float start_yaw_deg;
     float start_dx;
     float start_dy;
     float start_distance_m;
+    float heading_error_deg;
     uint32 start_index;
 
-    if(car_path_prepared && (car_path_count >= CAR_START_MIN_POINTS)
-            && car_local_datum_ready && car_gps_valid
-            && (gps_valid_fix_streak >= CAR_GPS_READY_FIX_COUNT))
+    if(!car_path_prepared || (car_path_count < CAR_START_MIN_POINTS))
+    {
+        car_error_code = CAR_ERROR_PATH_SHORT;
+        return 0;
+    }
+    if(!car_local_datum_ready)
+    {
+        car_error_code = CAR_ERROR_DATUM_NOT_READY;
+        return 0;
+    }
+    if(!car_gps_valid || (gps_valid_fix_streak < CAR_GPS_READY_FIX_COUNT))
+    {
+        car_error_code = CAR_ERROR_GPS_LOST;
+        return 0;
+    }
+
+    // 使能PWM前同时验证端点距离和车头方向；B是整车掉头后仍用正PWM前进。
+    start_index = (CAR_REPLAY_B_RETURN == mode) ? (car_path_count - 1) : 0;
+    start_dx = car_gps_x_m - car_path[start_index].x;
+    start_dy = car_gps_y_m - car_path[start_index].y;
+    start_distance_m = (float)sqrt(start_dx * start_dx + start_dy * start_dy);
+    car_cross_track_error_m = start_distance_m;
+    if(start_distance_m > CAR_GUIDE_START_MAX_DIST_M)
+    {
+        car_error_code = CAR_ERROR_START_TOO_FAR;
+        return 0;
+    }
+
+    *start_yaw_deg = car_path[start_index].yaw_deg;
+    if(CAR_REPLAY_B_RETURN == mode)
+    {
+        *start_yaw_deg = car_angle_to_360(*start_yaw_deg + 180.0f);
+    }
+    heading_error_deg = car_abs_f(car_wrap_deg(*start_yaw_deg - car_yaw_deg));
+    car_heading_error_deg = heading_error_deg;
+    if(heading_error_deg > CAR_GUIDE_START_HEADING_MAX_DEG)
+    {
+        car_error_code = CAR_ERROR_START_HEADING;
+        return 0;
+    }
+    return 1;
+}
+
+static void car_arm_guide(car_replay_mode_enum mode)
+{
+    float start_yaw_deg;
+
+    // 第一次按A/B只进入ARMED，不输出动力；同键第二次确认后才真正启动。
+    car_all_motor_stop();
+    if(!car_guide_precheck(mode, &start_yaw_deg))
+    {
+        car_replay_mode = CAR_REPLAY_NONE;
+        car_state = CAR_STATE_READY;
+        return;
+    }
+    car_error_code = CAR_ERROR_NONE;
+    car_replay_mode = mode;
+    car_elapsed_ms = 0;
+    car_state = CAR_STATE_ARMED;
+}
+
+static void car_start_guide(car_replay_mode_enum mode)
+{
+    float start_yaw_deg;
+    uint32 start_index;
+
+    if(car_guide_precheck(mode, &start_yaw_deg))
     {
         start_index = (CAR_REPLAY_B_RETURN == mode) ? (car_path_count - 1) : 0;
-        start_dx = car_gps_x_m - car_path[start_index].x;
-        start_dy = car_gps_y_m - car_path[start_index].y;
-        start_distance_m = (float)sqrt(start_dx * start_dx + start_dy * start_dy);
-        if(start_distance_m > CAR_GUIDE_START_MAX_DIST_M)
-        {
-            car_error_code = CAR_ERROR_START_TOO_FAR;
-            car_state = CAR_STATE_ERROR;
-            car_cross_track_error_m = start_distance_m;
-            car_all_motor_stop();
-            return;
-        }
 
         car_replay_mode = mode;
-        start_yaw_deg = car_path_travel_yaw(start_index);
         car_reset_runtime_pose_at(car_gps_x_m, car_gps_y_m, start_yaw_deg, 0);
         car_nearest_index = start_index;
         car_target_index = start_index;
@@ -1059,23 +1426,15 @@ static void car_start_guide(car_replay_mode_enum mode)
         guide_start_gps_x_m = car_gps_x_m;
         guide_start_gps_y_m = car_gps_y_m;
         car_pwm_sim_gps_dir_locked = 0;
+        guide_progress_anchor_s_m = car_path[start_index].s_m;
+        guide_progress_last_ms = 0;
+        car_error_code = CAR_ERROR_NONE;
         car_state = CAR_STATE_GUIDE;
     }
     else
     {
-        if(!car_path_prepared || (car_path_count < CAR_START_MIN_POINTS))
-        {
-            car_error_code = CAR_ERROR_PATH_SHORT;
-        }
-        else if(!car_local_datum_ready)
-        {
-            car_error_code = CAR_ERROR_DATUM_NOT_READY;
-        }
-        else
-        {
-            car_error_code = CAR_ERROR_GPS_LOST;
-        }
-        car_state = CAR_STATE_ERROR;
+        car_replay_mode = CAR_REPLAY_NONE;
+        car_state = CAR_STATE_READY;
         car_all_motor_stop();
     }
 }
@@ -1092,16 +1451,32 @@ static double car_signed_lon(double lon, int8 ew)
 
 static double car_lon_near_reference(double lon, double reference_lon)
 {
-    while((lon - reference_lon) > 180.0)  lon -= 360.0;
-    while((lon - reference_lon) < -180.0) lon += 360.0;
-    return lon;
+    double delta;
+
+    if(!car_double_is_finite(lon) || !car_double_is_finite(reference_lon))
+    {
+        return lon;
+    }
+    if(((lon - reference_lon) <= 180.0) && ((lon - reference_lon) >= -180.0))
+    {
+        return lon;
+    }
+    delta = fmod(lon - reference_lon, 360.0);
+    if(delta > 180.0)  delta -= 360.0;
+    if(delta < -180.0) delta += 360.0;
+    return reference_lon + delta;
 }
 
 #if CAR_LOCAL_DATUM_CAN_LOCK
 static double car_normalize_lon(double lon)
 {
-    while(lon > 180.0)  lon -= 360.0;
-    while(lon < -180.0) lon += 360.0;
+    if(!car_double_is_finite(lon))
+    {
+        return lon;
+    }
+    lon = fmod(lon, 360.0);
+    if(lon > 180.0)  lon -= 360.0;
+    if(lon < -180.0) lon += 360.0;
     return lon;
 }
 
@@ -1129,11 +1504,11 @@ static void car_local_datum_lock(double lat, double lon)
     car_gps_filter_reset();
     gps_valid_fix_streak = 0;
     gps_update_pending = 0;
+    car_local_datum_ready = 1;
     if(CAR_ERROR_DATUM_NOT_READY == car_error_code)
     {
         car_error_code = CAR_ERROR_NONE;
     }
-    car_local_datum_ready = 1;
 }
 #endif
 
@@ -1144,6 +1519,12 @@ static void car_local_datum_candidate_reset(void)
     local_datum_mean_lon = 0.0;
     local_datum_lon_seed = 0.0;
     local_datum_consecutive_rejects = 0;
+    local_datum_first_lat = 0.0;
+    local_datum_first_lon = 0.0;
+    local_datum_second_lat = 0.0;
+    local_datum_second_lon = 0.0;
+    local_datum_first_count = 0;
+    local_datum_second_count = 0;
     car_local_datum_sample_count = 0;
 }
 
@@ -1153,6 +1534,12 @@ static void car_local_datum_candidate_seed(double lat, double lon)
     local_datum_mean_lon = lon;
     local_datum_lon_seed = lon;
     local_datum_consecutive_rejects = 0;
+    local_datum_first_lat = lat;
+    local_datum_first_lon = lon;
+    local_datum_second_lat = 0.0;
+    local_datum_second_lon = 0.0;
+    local_datum_first_count = 1;
+    local_datum_second_count = 0;
     car_local_datum_sample_count = 1;
 }
 #endif
@@ -1207,6 +1594,8 @@ static uint8 car_local_datum_update(double lat, double lon, float gps_speed_mps)
 {
     double lon_near;
     double next_count;
+    double half_count;
+    float centroid_drift_m;
     float sample_distance_m;
 
     if(car_local_datum_ready)
@@ -1254,10 +1643,46 @@ static uint8 car_local_datum_update(double lat, double lon, float gps_speed_mps)
         local_datum_mean_lat += (lat - local_datum_mean_lat) / next_count;
         local_datum_mean_lon += (lon_near - local_datum_mean_lon) / next_count;
         car_local_datum_sample_count++;
+
+        // 分别统计前半段和后半段质心；慢漂即使一直落在1.5m半径内也不能锁基准。
+        if(car_local_datum_sample_count <= (CAR_LOCAL_DATUM_SAMPLE_COUNT / 2U))
+        {
+            half_count = (double)local_datum_first_count + 1.0;
+            local_datum_first_lat += (lat - local_datum_first_lat) / half_count;
+            local_datum_first_lon += (lon_near - local_datum_first_lon) / half_count;
+            local_datum_first_count++;
+        }
+        else
+        {
+            half_count = (double)local_datum_second_count + 1.0;
+            if(0 == local_datum_second_count)
+            {
+                local_datum_second_lat = lat;
+                local_datum_second_lon = lon_near;
+            }
+            else
+            {
+                local_datum_second_lat += (lat - local_datum_second_lat) / half_count;
+                local_datum_second_lon += (lon_near - local_datum_second_lon) / half_count;
+            }
+            local_datum_second_count++;
+        }
     }
 
     if(car_local_datum_sample_count >= CAR_LOCAL_DATUM_SAMPLE_COUNT)
     {
+        centroid_drift_m = car_geo_delta_m(local_datum_first_lat, local_datum_first_lon,
+                local_datum_second_lat, local_datum_second_lon);
+        if((0 == local_datum_second_count)
+                || (centroid_drift_m > CAR_LOCAL_DATUM_MAX_CENTROID_DRIFT_M))
+        {
+            if(car_local_datum_reject_count < 65535U)
+            {
+                car_local_datum_reject_count++;
+            }
+            car_local_datum_candidate_seed(lat, lon);
+            return 0;
+        }
         car_local_datum_sample_count = CAR_LOCAL_DATUM_SAMPLE_COUNT;
         car_local_datum_lock(local_datum_mean_lat, local_datum_mean_lon);
         return 1;
@@ -1279,6 +1704,12 @@ static void car_gps_clear_valid_fix(void)
 {
     car_gps_valid = 0;
     gps_valid_fix_streak = 0;
+    gps_publish_sequence++;
+    gps_update_pending = 0;
+    gps_pending_heading_valid = 0;
+    gps_publish_sequence++;
+    gps_heading_reset_requested = 1;
+    gps_filter_reset_requested = 1;
 #if !CAR_LOCAL_DATUM_FIXED_ENABLE
     if(!car_local_datum_ready)
     {
@@ -1301,7 +1732,21 @@ void car_nav_gnss_poll(void)
     double lon;
     float raw_x;
     float raw_y;
+    float filtered_x;
+    float filtered_y;
+    float gps_speed_mps;
+    float gps_yaw_deg;
+    float gps_heading_yaw_deg;
+    float heading_dx;
+    float heading_dy;
+    float heading_distance_m;
+    float raw_dx;
+    float raw_dy;
+    float raw_distance_m;
+    float raw_allowed_m;
+    float raw_dt_s;
     uint8 fix_valid;
+    uint8 gps_heading_valid = 0;
 
     // Check RMC age even while GGA/THS frames keep gnss_flag active.
     car_gps_check_stale();
@@ -1312,6 +1757,15 @@ void car_nav_gnss_poll(void)
 
     gnss_flag = 0;
     (void)gnss_data_parse();
+    // RMC提供位置/速度，GGA提供定位质量；两者必须都新鲜，不能沿用旧卫星数。
+    if(gnss_gga_count != gps_seen_gga_count)
+    {
+        gps_seen_gga_count = gnss_gga_count;
+        gps_last_gga_ms = nav_uptime_ms;
+        gps_gga_seen = 1;
+        car_gps_satellites = gnss.satellite_used;
+        gnss_gga_flag = 0;
+    }
     // RMC owns latitude/longitude/speed. GGA-only arrivals must not be counted as duplicate position fixes.
     if(!gnss_rmc_flag)
     {
@@ -1319,8 +1773,14 @@ void car_nav_gnss_poll(void)
     }
     gnss_rmc_flag = 0;
 
-    fix_valid = (gnss.state && (gnss.satellite_used >= CAR_GPS_MIN_SATELLITES)) ? 1 : 0;
-    gps_last_update_ms = nav_uptime_ms;
+    fix_valid = (gnss.state
+            && gps_gga_seen
+            && (gnss.satellite_used >= CAR_GPS_MIN_SATELLITES)
+            && (gnss.satellite_used <= 64U)
+            && (gnss.fix_quality > 0U) && (gnss.fix_quality <= 8U)
+            && car_float_is_finite(gnss.hdop)
+            && (gnss.hdop > 0.0f) && (gnss.hdop <= CAR_GPS_MAX_HDOP)
+            && ((uint32)(nav_uptime_ms - gps_last_gga_ms) <= CAR_GPS_GGA_STALE_MS)) ? 1 : 0;
     car_gps_satellites = gnss.satellite_used;
 
     if(!fix_valid)
@@ -1331,27 +1791,31 @@ void car_nav_gnss_poll(void)
 
     lat = car_signed_lat(gnss.latitude, gnss.ns);
     lon = car_signed_lon(gnss.longitude, gnss.ew);
-    car_gps_speed_mps = gnss.speed / 3.6f;
-    if(!((lat >= -90.0) && (lat <= 90.0)
+    gps_speed_mps = gnss.speed / 3.6f;
+    if(!(car_double_is_finite(lat) && car_double_is_finite(lon)
+            && car_float_is_finite(gps_speed_mps)
+            && car_float_is_finite(gnss.direction)
+            && (lat >= -90.0) && (lat <= 90.0)
             && (lon >= -180.0) && (lon <= 180.0)
             && ((gnss.ns == 'N') || (gnss.ns == 'n') || (gnss.ns == 'S') || (gnss.ns == 's'))
             && ((gnss.ew == 'E') || (gnss.ew == 'e') || (gnss.ew == 'W') || (gnss.ew == 'w'))
-            && (car_gps_speed_mps >= 0.0f)
-            && (car_gps_speed_mps <= CAR_GPS_DATA_MAX_SPEED_MPS)
+            && (gps_speed_mps >= 0.0f)
+            && (gps_speed_mps <= CAR_GPS_DATA_MAX_SPEED_MPS)
             && (gnss.direction >= 0.0f) && (gnss.direction <= 360.0f)))
     {
         car_gps_clear_valid_fix();
         return;
     }
-    car_gps_direction_deg = car_gps_course_to_math_yaw(gnss.direction);
-    // Publish validity only after the frame timestamp and all semantic checks are complete.
-    car_gps_valid = 1;
+    gps_yaw_deg = car_gps_course_to_math_yaw(gnss.direction);
 
     if(!car_local_datum_ready)
     {
+        // A semantically valid pre-datum RMC is still a live receiver heartbeat;
+        // otherwise the stale watchdog would reset the 5s datum candidate every loop.
+        gps_last_update_ms = nav_uptime_ms;
         gps_valid_fix_streak = 0;
 #if !CAR_LOCAL_DATUM_FIXED_ENABLE
-        if(!car_local_datum_update(lat, lon, car_gps_speed_mps))
+        if(!car_local_datum_update(lat, lon, gps_speed_mps))
         {
             return;
         }
@@ -1364,23 +1828,97 @@ void car_nav_gnss_poll(void)
     }
 
     car_gps_to_local(lat, lon, &raw_x, &raw_y);
-    car_gps_filter_update(raw_x, raw_y);
+#if CAR_LOCAL_DATUM_CAN_LOCK
+    if(gps_filter_reset_requested)
+    {
+        car_gps_filter_reset();
+    }
+#endif
+    if(!car_float_is_finite(raw_x) || !car_float_is_finite(raw_y))
+    {
+        car_gps_clear_valid_fix();
+        return;
+    }
+
+    // 原始位置先做“最大可能位移”门控，防止连续两个跳点穿透三点中值滤波。
+    if(gps_raw_initialized)
+    {
+        raw_dt_s = (float)(nav_uptime_ms - gps_last_raw_ms) * 0.001f;
+        raw_dx = raw_x - gps_last_raw_x;
+        raw_dy = raw_y - gps_last_raw_y;
+        raw_distance_m = (float)sqrt(raw_dx * raw_dx + raw_dy * raw_dy);
+        raw_allowed_m = CAR_GPS_RAW_JUMP_BASE_M
+                + CAR_GPS_RAW_JUMP_MAX_SPEED_MPS * raw_dt_s;
+        if(raw_distance_m > raw_allowed_m)
+        {
+            // Keep the previous coherent snapshot for an isolated jump. If no good
+            // frame returns, the normal accepted-fix watchdog expires and stops motion.
+            gps_valid_fix_streak = 0;
+            return;
+        }
+    }
+    gps_last_raw_x = raw_x;
+    gps_last_raw_y = raw_y;
+    gps_last_raw_ms = nav_uptime_ms;
+    gps_raw_initialized = 1;
+
+    car_gps_filter_update(raw_x, raw_y, &filtered_x, &filtered_y);
+    if(!car_float_is_finite(filtered_x) || !car_float_is_finite(filtered_y))
+    {
+        car_gps_clear_valid_fix();
+        return;
+    }
+
+    // 低速RMC航向容易抖动，累计0.5m GPS位移后再生成一次航向观测。
+    gps_heading_yaw_deg = gps_yaw_deg;
+    if(gps_heading_reset_requested)
+    {
+        gps_heading_anchor_initialized = 0;
+        gps_heading_reset_requested = 0;
+    }
+    if(!gps_heading_anchor_initialized)
+    {
+        gps_heading_anchor_x = filtered_x;
+        gps_heading_anchor_y = filtered_y;
+        gps_heading_anchor_initialized = 1;
+    }
+    else
+    {
+        heading_dx = filtered_x - gps_heading_anchor_x;
+        heading_dy = filtered_y - gps_heading_anchor_y;
+        heading_distance_m = (float)sqrt(heading_dx * heading_dx + heading_dy * heading_dy);
+        if(heading_distance_m >= CAR_GPS_HEADING_BASELINE_M)
+        {
+            gps_heading_yaw_deg = car_angle_to_360(
+                    (float)atan2(heading_dy, heading_dx) * CAR_RAD_TO_DEG);
+            gps_heading_anchor_x = filtered_x;
+            gps_heading_anchor_y = filtered_y;
+            gps_heading_valid = 1;
+        }
+    }
+
+    // Sequence-lock publication: the 10ms ISR either consumes the previous complete
+    // snapshot or this complete snapshot, never mixed X/Y/speed/yaw fields.
+    gps_publish_sequence++;
+    gps_pending_x_m = filtered_x;
+    gps_pending_y_m = filtered_y;
+    gps_pending_speed_mps = gps_speed_mps;
+    gps_pending_yaw_deg = gps_yaw_deg;
+    gps_pending_heading_yaw_deg = gps_heading_yaw_deg;
+    gps_pending_heading_valid = gps_heading_valid;
+    gps_update_pending = 1;
+    gps_publish_sequence++;
+    gps_last_update_ms = nav_uptime_ms;
+    car_gps_valid = 1;
     if(gps_valid_fix_streak < CAR_GPS_READY_FIX_COUNT)
     {
         gps_valid_fix_streak++;
     }
-    car_gps_fix_count++;
-
-    gps_pending_x_m = car_gps_x_m;
-    gps_pending_y_m = car_gps_y_m;
-    gps_pending_speed_mps = car_gps_speed_mps;
-    gps_pending_yaw_deg = car_gps_direction_deg;
-    gps_update_pending = 1;
 }
 
-static void car_encoder_update(void)
+static uint8 car_encoder_update(void)
 {
-    int16 steer_delta = encoder_get_count(CAR_STEER_ENCODER);
+    int32 steer_delta = (int32)encoder_get_count(CAR_STEER_ENCODER);
 
     encoder_clear_count(CAR_STEER_ENCODER);
 
@@ -1388,8 +1926,67 @@ static void car_encoder_update(void)
     steer_delta = -steer_delta;
 #endif
 
+    // 先用int32处理-32768反号，再检查10ms突跳和累计溢出，避免有符号溢出UB。
+    if((steer_delta > CAR_STEER_ENCODER_MAX_DELTA_10MS)
+            || (steer_delta < -CAR_STEER_ENCODER_MAX_DELTA_10MS)
+            || ((steer_delta > 0) && (car_steer_encoder_count > (INT_MAX - steer_delta)))
+            || ((steer_delta < 0) && (car_steer_encoder_count < (INT_MIN - steer_delta))))
+    {
+        car_fault_stop(CAR_ERROR_ENCODER);
+        return 0;
+    }
+
     car_steer_encoder_count += steer_delta;
+    if((car_steer_encoder_count > CAR_STEER_ENCODER_HARD_LIMIT)
+            || (car_steer_encoder_count < -CAR_STEER_ENCODER_HARD_LIMIT))
+    {
+        car_fault_stop(CAR_ERROR_ENCODER);
+        return 0;
+    }
+
+    // 根据“上一周期PWM—本周期增量”判断反向接线或机械堵转。
+    if(car_abs_f((float)car_steer_pwm_output) >= (float)CAR_STEER_MOVE_MIN_DUTY)
+    {
+        if(0 == steer_delta)
+        {
+            if(steer_stall_count < CAR_STEER_STALL_COUNT)
+            {
+                steer_stall_count++;
+            }
+        }
+        else
+        {
+            steer_stall_count = 0;
+        }
+
+        if(((car_steer_pwm_output > 0) && (steer_delta < 0))
+                || ((car_steer_pwm_output < 0) && (steer_delta > 0)))
+        {
+            if(steer_wrong_direction_count < CAR_STEER_WRONG_DIR_COUNT)
+            {
+                steer_wrong_direction_count++;
+            }
+        }
+        else if(0 != steer_delta)
+        {
+            steer_wrong_direction_count = 0;
+        }
+
+        if((steer_stall_count >= CAR_STEER_STALL_COUNT)
+                || (steer_wrong_direction_count >= CAR_STEER_WRONG_DIR_COUNT))
+        {
+            car_fault_stop(CAR_ERROR_ENCODER);
+            return 0;
+        }
+    }
+    else
+    {
+        steer_stall_count = 0;
+        steer_wrong_direction_count = 0;
+    }
+
     car_steer_angle_deg = car_steer_count_to_angle_deg((float)car_steer_encoder_count);
+    return 1;
 }
 
 static void car_pose_update(void)
@@ -1407,13 +2004,20 @@ static void car_pose_update(void)
     mpu6050_get_gyro();
     mpu6050_get_acc();
     gyro_z = (mpu6050_gyro_transition(mpu6050_gyro_z) - car_gyro_z_bias) * CAR_GYRO_SCALE;
+    acc_raw_g = mpu6050_acc_transition(CAR_IMU_FORWARD_RAW);
+    if(!car_mpu6050_ok || !car_float_is_finite(gyro_z) || !car_float_is_finite(acc_raw_g)
+            || (car_abs_f(gyro_z) > CAR_IMU_GYRO_MAX_DPS)
+            || (car_abs_f(acc_raw_g) > CAR_IMU_ACC_MAX_G))
+    {
+        car_fault_stop(CAR_ERROR_MPU);
+        return;
+    }
     if(car_abs_f(gyro_z) < CAR_GYRO_DEADBAND_DPS)
     {
         gyro_z = 0.0f;
     }
     car_gyro_z_dps = gyro_z;
 
-    acc_raw_g = mpu6050_acc_transition(CAR_IMU_FORWARD_RAW);
     acc_mps2 = (acc_raw_g - car_acc_forward_bias_g) * CAR_GRAVITY_MPS2 * CAR_IMU_FORWARD_SIGN;
     car_acc_forward_mps2 += (acc_mps2 - car_acc_forward_mps2) * CAR_ACC_LOWPASS_ALPHA;
     if(car_abs_f(car_acc_forward_mps2) < CAR_ACC_DEADBAND_MPS2)
@@ -1442,15 +2046,19 @@ static void car_pose_update(void)
     last_x = car_pose_x_m;
     last_y = car_pose_y_m;
     predict_acc_mps2 = car_acc_forward_mps2;
+    // 固定PWM不等于固定真实速度；有有效GPS时用实测速率约束传播模型，
+    // 避免电池/载荷变化把位置和自行车模型航向持续推偏。
     if(CAR_STATE_RECORDING == car_state)
     {
-        guide_model_speed = CAR_LOW_SPEED_MPS;
+        guide_model_speed = car_gps_valid ? car_gps_speed_mps : CAR_LOW_SPEED_MPS;
+        guide_model_speed = car_limit_f(guide_model_speed, CAR_IMU_SPEED_LIMIT_MPS);
         predict_acc_mps2 = (guide_model_speed - car_speed_mps) / CAR_GUIDE_SPEED_MODEL_TAU_S;
         predict_acc_mps2 = car_limit_f(predict_acc_mps2, CAR_GUIDE_SPEED_MODEL_ACC_MAX);
     }
     else if(CAR_STATE_GUIDE == car_state)
     {
-        guide_model_speed = CAR_LOW_SPEED_MPS;
+        guide_model_speed = car_gps_valid ? car_gps_speed_mps : CAR_LOW_SPEED_MPS;
+        guide_model_speed = car_limit_f(guide_model_speed, CAR_IMU_SPEED_LIMIT_MPS);
         predict_acc_mps2 = (guide_model_speed - car_speed_mps) / CAR_GUIDE_SPEED_MODEL_TAU_S;
         predict_acc_mps2 = car_limit_f(predict_acc_mps2, CAR_GUIDE_SPEED_MODEL_ACC_MAX);
     }
@@ -1470,6 +2078,16 @@ static void car_pose_update(void)
     ds = (float)sqrt((car_pose_x_m - last_x) * (car_pose_x_m - last_x)
                    + (car_pose_y_m - last_y) * (car_pose_y_m - last_y));
     car_ekf_apply_pending_gps();
+
+    if(!car_ekf_numeric_ok()
+            || !car_float_is_finite(car_pose_x_m)
+            || !car_float_is_finite(car_pose_y_m)
+            || !car_float_is_finite(car_yaw_deg)
+            || !car_float_is_finite(car_speed_mps))
+    {
+        car_fault_stop(CAR_ERROR_NUMERIC);
+        return;
+    }
 
     if(CAR_STATE_RECORDING == car_state)
     {
@@ -1634,6 +2252,8 @@ static void car_path_prepare(void)
     uint32 pass;
     uint32 old_count;
     uint32 write_index;
+    uint32 source_index;
+    uint32 target_count;
     uint32 index_a;
     uint32 index_b;
     float prev_x;
@@ -1647,17 +2267,38 @@ static void car_path_prepare(void)
     float next_steer;
     float dx;
     float dy;
-    float point_distance;
+    float total_length_m;
+    float residual_m;
+    float target_s_m;
+    float source_s_a;
+    float source_s_b;
+    float ratio;
     float yaw_a;
     float yaw_b;
     float ds;
 
+    // 先剔除非有限样本，防止一个NaN在多轮平滑后污染整条轨迹。
+    write_index = 0;
+    for(i = 0; i < car_path_count; i++)
+    {
+        if(car_float_is_finite(car_path[i].x)
+                && car_float_is_finite(car_path[i].y)
+                && car_float_is_finite(car_path[i].steer_count))
+        {
+            if(write_index != i)
+            {
+                car_path[write_index] = car_path[i];
+            }
+            write_index++;
+        }
+    }
+    car_path_count = write_index;
     if(car_path_count < 2)
     {
         return;
     }
 
-    // Convert noisy discrete fixes to one continuous polyline while preserving every bend in the taught route.
+    // 五轮[1,2,1]/4低通：压制GPS高频抖动，同时保留教学路线的实际弯曲形状。
     for(pass = 0; pass < CAR_PATH_SMOOTH_PASSES; pass++)
     {
         if(car_path_count < 3)
@@ -1689,36 +2330,79 @@ static void car_path_prepare(void)
         }
     }
 
-    // Compact to near-uniform spatial points so lookahead is measured in metres.
+    // 真正按弧长定距插值，不再只是“距离小于0.1m就丢点”。
+    // 此阶段借用尚未生成的yaw/yaw_rate/curvature字段保存原始x/y/steer，
+    // 因而无需再申请约96kB临时轨迹数组，且稀疏输入被补点时也不会覆盖源数据。
     old_count = car_path_count;
-    write_index = 1;
-    for(i = 1; i + 1 < old_count; i++)
+    car_path[0].s_m = 0.0f;
+    for(i = 1; i < old_count; i++)
     {
-        dx = car_path[i].x - car_path[write_index - 1].x;
-        dy = car_path[i].y - car_path[write_index - 1].y;
-        point_distance = (float)sqrt(dx * dx + dy * dy);
-        if(point_distance >= CAR_PATH_RESAMPLE_M)
+        dx = car_path[i].x - car_path[i - 1].x;
+        dy = car_path[i].y - car_path[i - 1].y;
+        car_path[i].s_m = car_path[i - 1].s_m + (float)sqrt(dx * dx + dy * dy);
+    }
+    total_length_m = car_path[old_count - 1].s_m;
+    if(!car_float_is_finite(total_length_m) || (total_length_m <= 0.0f))
+    {
+        car_path_count = 0;
+        return;
+    }
+
+    for(i = 0; i < old_count; i++)
+    {
+        car_path[i].yaw_deg = car_path[i].x;
+        car_path[i].yaw_rate_dps = car_path[i].y;
+        car_path[i].curvature = car_path[i].steer_count;
+    }
+
+    target_count = (uint32)(total_length_m / CAR_PATH_RESAMPLE_M) + 1U;
+    residual_m = total_length_m
+            - (float)(target_count - 1U) * CAR_PATH_RESAMPLE_M;
+    if(residual_m >= (CAR_PATH_RESAMPLE_M * 0.35f))
+    {
+        target_count++;
+    }
+    if((target_count < 2U) || (target_count > CAR_PATH_MAX_POINTS))
+    {
+        car_path_count = 0;
+        return;
+    }
+
+    source_index = 1;
+    for(write_index = 0; write_index < target_count; write_index++)
+    {
+        target_s_m = (write_index + 1U == target_count)
+                ? total_length_m : (float)write_index * CAR_PATH_RESAMPLE_M;
+        while((source_index + 1U < old_count)
+                && (car_path[source_index].s_m < target_s_m))
         {
-            if(write_index != i)
-            {
-                car_path[write_index] = car_path[i];
-            }
-            write_index++;
+            source_index++;
         }
+        source_s_a = car_path[source_index - 1U].s_m;
+        source_s_b = car_path[source_index].s_m;
+        if(source_s_b > source_s_a)
+        {
+            ratio = (target_s_m - source_s_a) / (source_s_b - source_s_a);
+            ratio = car_limit_f(ratio, 1.0f);
+            if(ratio < 0.0f) ratio = 0.0f;
+        }
+        else
+        {
+            ratio = 0.0f;
+        }
+        car_path[write_index].x = car_path[source_index - 1U].yaw_deg
+                + ratio * (car_path[source_index].yaw_deg
+                    - car_path[source_index - 1U].yaw_deg);
+        car_path[write_index].y = car_path[source_index - 1U].yaw_rate_dps
+                + ratio * (car_path[source_index].yaw_rate_dps
+                    - car_path[source_index - 1U].yaw_rate_dps);
+        car_path[write_index].steer_count = car_limit_f(
+                car_path[source_index - 1U].curvature
+                + ratio * (car_path[source_index].curvature
+                    - car_path[source_index - 1U].curvature),
+                CAR_STEER_TARGET_LIMIT);
     }
-    dx = car_path[old_count - 1].x - car_path[write_index - 1].x;
-    dy = car_path[old_count - 1].y - car_path[write_index - 1].y;
-    point_distance = (float)sqrt(dx * dx + dy * dy);
-    if(point_distance >= (CAR_PATH_RESAMPLE_M * 0.35f))
-    {
-        car_path[write_index] = car_path[old_count - 1];
-        write_index++;
-    }
-    else if(write_index > 1)
-    {
-        car_path[write_index - 1] = car_path[old_count - 1];
-    }
-    car_path_count = write_index;
+    car_path_count = target_count;
 
     car_path[0].s_m = 0.0f;
     for(i = 1; i < car_path_count; i++)
@@ -1728,41 +2412,81 @@ static void car_path_prepare(void)
         car_path[i].s_m = car_path[i - 1].s_m + (float)sqrt(dx * dx + dy * dy);
     }
 
-    // Geometry supplies absolute course; the steering encoder supplies the low-rate curvature/feed-forward shape.
+    // 用0.5m空间弦计算绝对航向，而不是用相邻短线段；首末端也能抵抗厘米级噪声。
     for(i = 0; i < car_path_count; i++)
     {
-        index_a = (i > 0) ? (i - 1) : 0;
-        index_b = i + 1;
-        if(index_b >= car_path_count)
+        index_a = i;
+        index_b = i;
+        while(((car_path[index_b].s_m - car_path[index_a].s_m) < CAR_PATH_YAW_SPAN_M)
+                && ((index_a > 0) || (index_b + 1 < car_path_count)))
         {
-            index_b = car_path_count - 1;
+            if(0 == index_a)
+            {
+                index_b++;
+            }
+            else if(index_b + 1 >= car_path_count)
+            {
+                index_a--;
+            }
+            else if((car_path[i].s_m - car_path[index_a].s_m)
+                    <= (car_path[index_b].s_m - car_path[i].s_m))
+            {
+                index_a--;
+            }
+            else
+            {
+                index_b++;
+            }
         }
         dx = car_path[index_b].x - car_path[index_a].x;
         dy = car_path[index_b].y - car_path[index_a].y;
-        car_path[i].yaw_deg = car_angle_to_360((float)atan2(dy, dx) * CAR_RAD_TO_DEG);
+        if((dx * dx + dy * dy) > 0.000001f)
+        {
+            car_path[i].yaw_deg = car_angle_to_360((float)atan2(dy, dx) * CAR_RAD_TO_DEG);
+        }
+        else
+        {
+            car_path[i].yaw_deg = (i > 0) ? car_path[i - 1].yaw_deg : 0.0f;
+        }
+        car_path[i].curvature = 0.0f;
         car_path[i].direction = 1;
+        car_path[i].gps_valid = car_path_has_gps ? 1U : 0U;
         car_path[i].speed_mps = CAR_LOW_SPEED_MPS;
         car_path[i].time_ms = (uint32)(car_path[i].s_m / CAR_LOW_SPEED_MPS * 1000.0f);
     }
 
     for(i = 0; i < car_path_count; i++)
     {
-        if((i > 0) && (i + 1 < car_path_count))
+        index_a = i;
+        index_b = i;
+        while(((car_path[index_b].s_m - car_path[index_a].s_m) < CAR_PATH_YAW_SPAN_M)
+                && ((index_a > 0) || (index_b + 1 < car_path_count)))
         {
-            yaw_a = car_path[i - 1].yaw_deg;
-            yaw_b = car_path[i + 1].yaw_deg;
-            ds = car_path[i + 1].s_m - car_path[i - 1].s_m;
-            if(ds > 0.001f)
+            if(0 == index_a)
             {
-                car_path[i].curvature = car_wrap_deg(yaw_b - yaw_a) * CAR_DEG_TO_RAD / ds;
+                index_b++;
+            }
+            else if(index_b + 1 >= car_path_count)
+            {
+                index_a--;
+            }
+            else if((car_path[i].s_m - car_path[index_a].s_m)
+                    <= (car_path[index_b].s_m - car_path[i].s_m))
+            {
+                index_a--;
+            }
+            else
+            {
+                index_b++;
             }
         }
-    }
-
-    if(car_path_count > 2)
-    {
-        car_path[0].curvature = car_path[1].curvature;
-        car_path[car_path_count - 1].curvature = car_path[car_path_count - 2].curvature;
+        yaw_a = car_path[index_a].yaw_deg;
+        yaw_b = car_path[index_b].yaw_deg;
+        ds = car_path[index_b].s_m - car_path[index_a].s_m;
+        if(ds > 0.001f)
+        {
+            car_path[i].curvature = car_wrap_deg(yaw_b - yaw_a) * CAR_DEG_TO_RAD / ds;
+        }
     }
     for(i = 0; i < car_path_count; i++)
     {
@@ -1770,6 +2494,44 @@ static void car_path_prepare(void)
     }
     car_path_duration_ms = car_path[car_path_count - 1].time_ms;
     car_path_calc_fixed_rear_pwm();
+}
+
+static uint8 car_path_validate(void)
+{
+    uint32 i;
+    float dx;
+    float dy;
+    float segment_m;
+
+    // 平滑后再次检查有限数、严格递增弧长、最大断点和最短有效路线。
+    if((car_path_count < CAR_START_MIN_POINTS) || (car_path_count > CAR_PATH_MAX_POINTS))
+    {
+        return 0;
+    }
+    for(i = 0; i < car_path_count; i++)
+    {
+        if(!car_float_is_finite(car_path[i].x)
+                || !car_float_is_finite(car_path[i].y)
+                || !car_float_is_finite(car_path[i].s_m)
+                || !car_float_is_finite(car_path[i].yaw_deg)
+                || !car_float_is_finite(car_path[i].curvature)
+                || !car_float_is_finite(car_path[i].steer_count))
+        {
+            return 0;
+        }
+        if(i > 0)
+        {
+            dx = car_path[i].x - car_path[i - 1].x;
+            dy = car_path[i].y - car_path[i - 1].y;
+            segment_m = (float)sqrt(dx * dx + dy * dy);
+            if(!(car_path[i].s_m > car_path[i - 1].s_m)
+                    || (segment_m > CAR_PATH_MAX_SEGMENT_M))
+            {
+                return 0;
+            }
+        }
+    }
+    return (car_path[car_path_count - 1].s_m >= CAR_PATH_MIN_LENGTH_M) ? 1 : 0;
 }
 
 static uint32 car_find_nearest_index(void)
@@ -1786,6 +2548,11 @@ static uint32 car_find_nearest_index(void)
     float best_dist2 = 1000000.0f;
     uint8 found = 0;
 
+    if(0 == car_path_count)
+    {
+        car_cross_track_error_m = 0.0f;
+        return 0;
+    }
     if(previous >= car_path_count)
     {
         previous = car_replay_is_return() ? (car_path_count - 1) : 0;
@@ -1839,29 +2606,66 @@ static uint32 car_find_nearest_index(void)
         }
     }
 
-    if((!car_replay_is_return() && (best < previous))
-            || (car_replay_is_return() && (best > previous)))
+    // 每10ms最多前进1个点，并允许小幅回退；单次GPS偏移不再造成永久跳段。
+    if(car_replay_is_return())
     {
-        best = previous;
-        dx = car_path[best].x - car_pose_x_m;
-        dy = car_path[best].y - car_pose_y_m;
-        best_dist2 = dx * dx + dy * dy;
+        begin = (previous > CAR_NEAREST_MAX_ADVANCE_PT)
+                ? (previous - CAR_NEAREST_MAX_ADVANCE_PT) : 0;
+        end = previous + CAR_NEAREST_MAX_REGRESS_PT;
+        if(end >= car_path_count) end = car_path_count - 1;
     }
+    else
+    {
+        begin = (previous > CAR_NEAREST_MAX_REGRESS_PT)
+                ? (previous - CAR_NEAREST_MAX_REGRESS_PT) : 0;
+        end = previous + CAR_NEAREST_MAX_ADVANCE_PT;
+        if(end >= car_path_count) end = car_path_count - 1;
+    }
+    if(best < begin) best = begin;
+    if(best > end) best = end;
 
-    car_cross_track_error_m = sqrt(best_dist2);
+    dx = car_path[best].x - car_pose_x_m;
+    dy = car_path[best].y - car_pose_y_m;
+    best_dist2 = dx * dx + dy * dy;
+
+    car_cross_track_error_m = (float)sqrt(best_dist2);
     return best;
 }
 
 static uint32 car_find_gps_nearest_index(float *distance_m)
 {
     uint32 i;
-    uint32 best = 0;
+    uint32 begin;
+    uint32 end;
+    uint32 best;
     float dx;
     float dy;
     float dist2;
     float best_dist2 = 1000000.0f;
 
-    for(i = 0; i < car_path_count; i++)
+    if(0 == car_path_count)
+    {
+        *distance_m = 1000.0f;
+        return 0;
+    }
+    best = (car_nearest_index < car_path_count) ? car_nearest_index
+            : (car_replay_is_return() ? (car_path_count - 1) : 0);
+    // 安全距离只在当前进度附近搜索，避免自交/平行路线把“跑错分支”误判为安全。
+    if(car_replay_is_return())
+    {
+        begin = (best > CAR_GPS_SAFETY_WINDOW_AHEAD_PT)
+                ? (best - CAR_GPS_SAFETY_WINDOW_AHEAD_PT) : 0;
+        end = best + CAR_GPS_SAFETY_WINDOW_BACK_PT + 1;
+    }
+    else
+    {
+        begin = (best > CAR_GPS_SAFETY_WINDOW_BACK_PT)
+                ? (best - CAR_GPS_SAFETY_WINDOW_BACK_PT) : 0;
+        end = best + CAR_GPS_SAFETY_WINDOW_AHEAD_PT + 1;
+    }
+    if(end > car_path_count) end = car_path_count;
+
+    for(i = begin; i < end; i++)
     {
         dx = car_path[i].x - car_gps_x_m;
         dy = car_path[i].y - car_gps_y_m;
@@ -1873,7 +2677,7 @@ static uint32 car_find_gps_nearest_index(float *distance_m)
         }
     }
 
-    *distance_m = sqrt(best_dist2);
+    *distance_m = (float)sqrt(best_dist2);
     return best;
 }
 
@@ -1926,6 +2730,10 @@ static uint32 car_find_sim_nearest_index(void)
     float dist2;
     float best_dist2 = 1000000.0f;
 
+    if(0 == car_path_count)
+    {
+        return 0;
+    }
     if(best >= car_path_count)
     {
         best = car_replay_is_return() ? (car_path_count - 1) : 0;
@@ -1969,6 +2777,11 @@ static uint8 car_guide_should_finish(void)
     float end_distance_m;
     uint8 endpoint_index_reached;
 
+    if(0 == car_path_count)
+    {
+        return 2;
+    }
+
     end_index = car_replay_endpoint_index();
     end_dx = car_path[end_index].x - car_pose_x_m;
     end_dy = car_path[end_index].y - car_pose_y_m;
@@ -1992,7 +2805,7 @@ static uint8 car_guide_should_finish(void)
         if(finish_last_fix != car_gps_fix_count)
         {
             finish_last_fix = car_gps_fix_count;
-            if(endpoint_index_reached && (end_distance_m <= CAR_GPS_PRIORITY_STOP_M))
+            if(endpoint_index_reached && (end_distance_m <= CAR_PATH_FINISH_FAILSAFE_M))
             {
                 if(finish_endpoint_fix_count < CAR_PATH_FINISH_STOP_FIX_COUNT)
                 {
@@ -2022,8 +2835,9 @@ static uint8 car_guide_should_finish(void)
 
     if(car_path_duration_ms > 0)
     {
-        finish_time_ms = (uint32)((float)car_path_duration_ms * CAR_GUIDE_FINISH_TIME_SCALE)
-                       + CAR_GUIDE_FINISH_MARGIN_MS;
+        finish_time_ms = (uint32)(car_path[car_path_count - 1].s_m
+                / CAR_GUIDE_TIMEOUT_MIN_SPEED_MPS * 1000.0f)
+                + CAR_GUIDE_FINISH_MARGIN_MS;
         if(car_elapsed_ms >= finish_time_ms)
         {
             return 2;
@@ -2037,6 +2851,11 @@ static uint32 car_find_time_index(uint32 time_ms)
 {
     uint32 i;
     uint32 best = car_nearest_index;
+
+    if(0 == car_path_count)
+    {
+        return 0;
+    }
 
     if(best >= car_path_count)
     {
@@ -2057,6 +2876,15 @@ static uint32 car_find_target_index(uint32 nearest)
 {
     uint32 i;
     float target_s_m;
+
+    if(0 == car_path_count)
+    {
+        return 0;
+    }
+    if(nearest >= car_path_count)
+    {
+        nearest = car_path_count - 1;
+    }
 
     car_lookahead_m = CAR_LOOKAHEAD_MIN_M + car_abs_f(car_target_speed_mps) * CAR_LOOKAHEAD_GAIN;
     if(car_lookahead_m > CAR_LOOKAHEAD_MAX_M)
@@ -2120,8 +2948,14 @@ static float car_signed_cross_track(uint32 index)
 static int16 car_steer_position_pwm(float target_count)
 {
     float error;
+    float output_float;
     int32 output;
 
+    if(!car_float_is_finite(target_count))
+    {
+        car_fault_stop(CAR_ERROR_NUMERIC);
+        return 0;
+    }
     error = target_count - (float)car_steer_encoder_count;
     if(car_abs_f(error) <= CAR_STEER_POSITION_TOL_CNT)
     {
@@ -2129,7 +2963,14 @@ static int16 car_steer_position_pwm(float target_count)
         return 0;
     }
 
-    output = (int32)car_pid_calc(&steer_pos_pid, target_count, (float)car_steer_encoder_count);
+    output_float = car_pid_calc(&steer_pos_pid, target_count, (float)car_steer_encoder_count);
+    if(!car_float_is_finite(output_float))
+    {
+        car_fault_stop(CAR_ERROR_NUMERIC);
+        return 0;
+    }
+    output_float = car_limit_f(output_float, (float)CAR_STEER_PWM_LIMIT);
+    output = (int32)output_float;
     if((output > 0) && (output < CAR_STEER_MOVE_MIN_DUTY))
     {
         output = CAR_STEER_MOVE_MIN_DUTY;
@@ -2170,22 +3011,33 @@ static float car_track_pid_correction(float signed_cte_m)
     float excess_cte_m;
     float correction;
 
-    if(car_abs_f(signed_cte_m) <= CAR_TRACK_TOLERANCE_M)
+    // 未越过0.35m时输出严格为0；一旦越界，继续纠偏到0.28m再释放，
+    // 防止GPS噪声在边界附近反复开关转向。
+    if(!car_track_correction_active)
+    {
+        if(car_abs_f(signed_cte_m) <= CAR_TRACK_TOLERANCE_M)
+        {
+            car_pid_clear(&track_pid);
+            return 0.0f;
+        }
+        car_track_correction_active = 1;
+        car_pid_clear(&track_pid);
+    }
+    else if(car_abs_f(signed_cte_m) <= CAR_TRACK_RECOVER_M)
     {
         car_track_correction_active = 0;
         car_pid_clear(&track_pid);
         return 0.0f;
     }
 
-    car_track_correction_active = 1;
     excess_cte_m = signed_cte_m;
     if(excess_cte_m > 0.0f)
     {
-        excess_cte_m -= CAR_TRACK_TOLERANCE_M;
+        excess_cte_m -= CAR_TRACK_RECOVER_M;
     }
     else
     {
-        excess_cte_m += CAR_TRACK_TOLERANCE_M;
+        excess_cte_m += CAR_TRACK_RECOVER_M;
     }
 
     correction = car_pid_calc(&track_pid, excess_cte_m, 0.0f)
@@ -2202,6 +3054,7 @@ static void car_guide_update(void)
     int16 rear_pwm;
     int16 steer_pwm;
     uint8 finish_reason;
+    float progress_s_m;
 
     if((car_path_count < CAR_START_MIN_POINTS) || !car_gps_valid)
     {
@@ -2215,6 +3068,22 @@ static void car_guide_update(void)
     car_target_speed_mps = CAR_LOW_SPEED_MPS;
     car_drive_direction = 1;
     car_select_reference();
+
+    progress_s_m = car_path[car_nearest_index].s_m;
+    // 进度必须沿所选方向真实增长；索引来回抖动不能冒充车辆正在前进。
+    if(((!car_replay_is_return())
+                && (progress_s_m >= guide_progress_anchor_s_m + CAR_GUIDE_PROGRESS_MIN_M))
+            || (car_replay_is_return()
+                && (progress_s_m + CAR_GUIDE_PROGRESS_MIN_M <= guide_progress_anchor_s_m)))
+    {
+        guide_progress_anchor_s_m = progress_s_m;
+        guide_progress_last_ms = car_elapsed_ms;
+    }
+    else if((car_elapsed_ms - guide_progress_last_ms) >= CAR_GUIDE_NO_PROGRESS_MS)
+    {
+        car_fault_stop(CAR_ERROR_NO_PROGRESS);
+        return;
+    }
 
 #if CAR_GPS_PRIORITY_STOP_ENABLE
     if(car_gps_priority_should_stop())
@@ -2249,7 +3118,21 @@ static void car_guide_update(void)
             * (car_replay_is_return() ? -1.0f : 1.0f);
     car_target_steer_count = car_limit_f(steer_target, CAR_STEER_TARGET_LIMIT);
 
+    if(!car_float_is_finite(cte)
+            || !car_float_is_finite(car_heading_error_deg)
+            || !car_float_is_finite(car_target_steer_count)
+            || !car_float_is_finite(car_cross_track_error_m))
+    {
+        car_fault_stop(CAR_ERROR_NUMERIC);
+        return;
+    }
+
     steer_pwm = car_steer_position_pwm(car_target_steer_count);
+    if(CAR_STATE_ERROR == car_state)
+    {
+        car_all_motor_stop();
+        return;
+    }
     rear_pwm = car_slew_pwm(CAR_LOW_SPEED_REAR_PWM);
 
     car_steer_pwm_output = steer_pwm;
@@ -2279,12 +3162,106 @@ static void car_guide_update(void)
     }
 }
 
+static void car_clear_taught_path(void)
+{
+    car_path_count = 0;
+    car_path_duration_ms = 0;
+    car_path_has_gps = 0;
+    car_path_prepared = 0;
+    car_replay_mode = CAR_REPLAY_NONE;
+    car_error_code = CAR_ERROR_NONE;
+    car_state = CAR_STATE_WAIT_START;
+}
+
+static void car_ready_single_key_action(uint8 key)
+{
+    car_replay_mode_enum mode = (1U == key)
+            ? CAR_REPLAY_A_FORWARD : CAR_REPLAY_B_RETURN;
+
+#if CAR_GUIDE_ARM_CONFIRM_ENABLE
+    car_arm_guide(mode);
+#else
+    car_start_guide(mode);
+#endif
+}
+
+static void car_ready_button_update(uint8 key_a_cmd, uint8 key_b_cmd)
+{
+    if(ready_wait_release)
+    {
+        if((CAR_KEY_RELEASE_LEVEL == car_key1_level)
+                && (CAR_KEY_RELEASE_LEVEL == car_key2_level))
+        {
+            ready_wait_release = 0;
+            ready_pending_key = 0;
+            ready_pending_count = 0;
+            ready_chord_count = 0;
+        }
+        return;
+    }
+
+    // READY中双键稳定按住800ms才清轨迹；单键先等待300ms双键判定窗口，
+    // 解决两个下降沿不可能恰好落在同一10ms而误启动的问题。
+    if((CAR_KEY_ACTIVE_LEVEL == car_key1_level)
+            && (CAR_KEY_ACTIVE_LEVEL == car_key2_level))
+    {
+        ready_pending_key = 0;
+        ready_pending_count = 0;
+        if(ready_chord_count < CAR_KEY_CHORD_HOLD_COUNT)
+        {
+            ready_chord_count++;
+        }
+        if(ready_chord_count >= CAR_KEY_CHORD_HOLD_COUNT)
+        {
+            car_clear_taught_path();
+            ready_wait_release = 1;
+        }
+        return;
+    }
+    ready_chord_count = 0;
+
+    if(ready_pending_key)
+    {
+        if(((1U == ready_pending_key) && key_b_cmd)
+                || ((2U == ready_pending_key) && key_a_cmd))
+        {
+            // Ambiguous near-simultaneous press: launch neither route.
+            ready_pending_key = 0;
+            ready_pending_count = 0;
+            ready_wait_release = 1;
+            return;
+        }
+        if(ready_pending_count > 0)
+        {
+            ready_pending_count--;
+        }
+        if(0 == ready_pending_count)
+        {
+            uint8 key = ready_pending_key;
+            ready_pending_key = 0;
+            ready_wait_release = 1;
+            car_ready_single_key_action(key);
+        }
+        return;
+    }
+
+    if(key_a_cmd != key_b_cmd)
+    {
+        ready_pending_key = key_a_cmd ? 1U : 2U;
+        ready_pending_count = CAR_KEY_CHORD_WINDOW_COUNT;
+    }
+}
+
+static uint8 car_error_is_latched(void)
+{
+    return ((CAR_ERROR_MPU == car_error_code)
+            || (CAR_ERROR_ENCODER == car_error_code)
+            || (CAR_ERROR_NUMERIC == car_error_code)
+            || (CAR_ERROR_CONTROL_OVERRUN == car_error_code)) ? 1 : 0;
+}
+
 void car_nav_control_10ms(void)
 {
-    static uint8 last_key1_level = CAR_KEY_RELEASE_LEVEL;
-    static uint8 last_key2_level = CAR_KEY_RELEASE_LEVEL;
-    static uint8 key1_cooldown = 0;
-    static uint8 key2_cooldown = 0;
     uint8 key_a_cmd = 0;
     uint8 key_b_cmd = 0;
 
@@ -2298,29 +3275,33 @@ void car_nav_control_10ms(void)
     car_key1_level = gpio_get_level(CAR_KEY_A_PIN);
     car_key2_level = gpio_get_level(CAR_KEY_B_PIN);
 
-    if(key1_cooldown > 0)
+    if(key_a_cooldown > 0)
     {
-        key1_cooldown--;
+        key_a_cooldown--;
     }
-    if(key2_cooldown > 0)
+    if(key_b_cooldown > 0)
     {
-        key2_cooldown--;
+        key_b_cooldown--;
     }
 
-    if((0 == key1_cooldown) && (CAR_KEY_RELEASE_LEVEL == last_key1_level) && (CAR_KEY_ACTIVE_LEVEL == car_key1_level))
+    if((0 == key_a_cooldown) && (CAR_KEY_RELEASE_LEVEL == key_last_a_level) && (CAR_KEY_ACTIVE_LEVEL == car_key1_level))
     {
         key_a_cmd = 1;
-        key1_cooldown = CAR_KEY_COOLDOWN_COUNT;
+        key_a_cooldown = CAR_KEY_COOLDOWN_COUNT;
     }
-    if((0 == key2_cooldown) && (CAR_KEY_RELEASE_LEVEL == last_key2_level) && (CAR_KEY_ACTIVE_LEVEL == car_key2_level))
+    if((0 == key_b_cooldown) && (CAR_KEY_RELEASE_LEVEL == key_last_b_level) && (CAR_KEY_ACTIVE_LEVEL == car_key2_level))
     {
         key_b_cmd = 1;
-        key2_cooldown = CAR_KEY_COOLDOWN_COUNT;
+        key_b_cooldown = CAR_KEY_COOLDOWN_COUNT;
     }
-    last_key1_level = car_key1_level;
-    last_key2_level = car_key2_level;
+    key_last_a_level = car_key1_level;
+    key_last_b_level = car_key2_level;
 
-    car_encoder_update();
+    if(!car_encoder_update())
+    {
+        car_all_motor_stop();
+        return;
+    }
     car_pose_update();
 
     if(CAR_STATE_SELF_TEST == car_state)
@@ -2333,7 +3314,7 @@ void car_nav_control_10ms(void)
     {
         car_all_motor_stop();
         car_replay_mode = CAR_REPLAY_NONE;
-        if(key_a_cmd)
+        if(key_a_cmd && !key_b_cmd && (CAR_KEY_RELEASE_LEVEL == car_key2_level))
         {
             car_start_recording();
         }
@@ -2372,23 +3353,29 @@ void car_nav_control_10ms(void)
     if((CAR_STATE_READY == car_state) || (CAR_STATE_FINISHED == car_state))
     {
         car_all_motor_stop();
+        car_ready_button_update(key_a_cmd, key_b_cmd);
+        return;
+    }
+
+    if(CAR_STATE_ARMED == car_state)
+    {
+        car_all_motor_stop();
         if(key_a_cmd && key_b_cmd)
         {
-            car_path_count = 0;
-            car_path_duration_ms = 0;
-            car_path_has_gps = 0;
-            car_path_prepared = 0;
             car_replay_mode = CAR_REPLAY_NONE;
-            car_error_code = CAR_ERROR_NONE;
-            car_state = CAR_STATE_WAIT_START;
+            car_state = CAR_STATE_READY;
         }
-        else if(key_a_cmd)
+        else if((car_elapsed_ms >= CAR_GUIDE_ARM_MIN_MS)
+                && (((CAR_REPLAY_A_FORWARD == car_replay_mode) && key_a_cmd)
+                    || ((CAR_REPLAY_B_RETURN == car_replay_mode) && key_b_cmd)))
         {
-            car_start_guide(CAR_REPLAY_A_FORWARD);
+            car_start_guide(car_replay_mode);
         }
-        else if(key_b_cmd)
+        else if(((CAR_REPLAY_A_FORWARD == car_replay_mode) && key_b_cmd)
+                || ((CAR_REPLAY_B_RETURN == car_replay_mode) && key_a_cmd))
         {
-            car_start_guide(CAR_REPLAY_B_RETURN);
+            car_replay_mode = CAR_REPLAY_NONE;
+            car_state = CAR_STATE_READY;
         }
         return;
     }
@@ -2410,7 +3397,7 @@ void car_nav_control_10ms(void)
     if(CAR_STATE_ERROR == car_state)
     {
         car_all_motor_stop();
-        if(key_a_cmd || key_b_cmd)
+        if((key_a_cmd || key_b_cmd) && !car_error_is_latched())
         {
             car_error_code = CAR_ERROR_NONE;
             car_replay_mode = CAR_REPLAY_NONE;
@@ -2438,7 +3425,7 @@ void car_nav_background(void)
     if(CAR_STATE_PROCESSING == car_state)
     {
         car_path_prepare();
-        if(car_path_count >= CAR_START_MIN_POINTS)
+        if(car_path_validate())
         {
             car_error_code = CAR_ERROR_NONE;
             car_replay_mode = CAR_REPLAY_NONE;
@@ -2448,7 +3435,8 @@ void car_nav_background(void)
         else
         {
             car_path_prepared = 0;
-            car_error_code = CAR_ERROR_PATH_SHORT;
+            car_error_code = (car_path_count < CAR_START_MIN_POINTS)
+                    ? CAR_ERROR_PATH_SHORT : CAR_ERROR_PATH_INVALID;
             car_state = CAR_STATE_ERROR;
         }
     }
@@ -2463,6 +3451,9 @@ static void car_display_state_text(uint16 x, uint16 y)
     else if(CAR_STATE_RECORDING == car_state)    ips200_show_string(x, y, "REC   ");
     else if(CAR_STATE_PROCESSING == car_state)   ips200_show_string(x, y, "SMOOTH");
     else if(CAR_STATE_READY == car_state)        ips200_show_string(x, y, "READY ");
+    else if((CAR_STATE_ARMED == car_state) && (CAR_REPLAY_B_RETURN == car_replay_mode))
+                                                    ips200_show_string(x, y, "ARM B ");
+    else if(CAR_STATE_ARMED == car_state)        ips200_show_string(x, y, "ARM A ");
     else if((CAR_STATE_GUIDE == car_state) && (CAR_REPLAY_B_RETURN == car_replay_mode))
                                                     ips200_show_string(x, y, "BACK B");
     else if(CAR_STATE_GUIDE == car_state)        ips200_show_string(x, y, "FWD A ");
@@ -2497,6 +3488,11 @@ static void car_display_map_point(float x_m, float y_m, uint16 color)
     float half_field;
     int16 px;
     int16 py;
+
+    if(!car_float_is_finite(x_m) || !car_float_is_finite(y_m))
+    {
+        return;
+    }
 
     scale_x = (float)(map_width - 2) / CAR_DISPLAY_MAP_FIELD_M;
     scale_y = (float)(map_height - 2) / CAR_DISPLAY_MAP_FIELD_M;
@@ -2641,7 +3637,7 @@ static void car_display_ready(void)
     ips200_show_string(64, 32, "SAT:");
     ips200_show_uint(104, 32, car_gps_satellites, 2);
     ips200_show_string(136, 32, "EC:");
-    ips200_show_uint(160, 32, car_error_code, 1);
+    ips200_show_uint(160, 32, car_error_code, 2);
 
     if(CAR_STATE_WAIT_START == car_state)
     {
@@ -2690,12 +3686,23 @@ static void car_display_ready(void)
         }
         else
         {
-            ips200_show_string(0, 80, "DATUM OK: KEY A TO TEACH      ");
+            ips200_show_string(0, 80, "CENTER WHEEL; KEY A TO TEACH  ");
         }
     }
     else if((CAR_STATE_READY == car_state) || (CAR_STATE_FINISHED == car_state))
     {
-        ips200_show_string(0, 80, "A:FWD  B:RETURN  A+B:CLEAR");
+        ips200_show_string(0, 80, "A/B SELECT; ALIGN KART NOSE   ");
+    }
+    else if(CAR_STATE_ARMED == car_state)
+    {
+        if(CAR_REPLAY_B_RETURN == car_replay_mode)
+        {
+            ips200_show_string(0, 80, "NOSE->START; PRESS B AGAIN    ");
+        }
+        else
+        {
+            ips200_show_string(0, 80, "NOSE->FINISH; PRESS A AGAIN   ");
+        }
     }
     else if(CAR_STATE_PROCESSING == car_state)
     {
@@ -2731,11 +3738,20 @@ void car_nav_display(void)
     }
 }
 
+uint32 car_nav_uptime(void)
+{
+    return nav_uptime_ms;
+}
+
 void car_nav_init(void)
 {
     uint16 i;
     float gyro_sum = 0.0f;
+    float gyro_square_sum = 0.0f;
     float acc_sum = 0.0f;
+    float acc_square_sum = 0.0f;
+    float sample;
+    float variance;
 
     gpio_init(CAR_LEFT_MOTOR_DIR_PIN,  GPO, CAR_MOTOR_FORWARD_LEVEL, GPO_PUSH_PULL);
     gpio_init(CAR_RIGHT_MOTOR_DIR_PIN, GPO, CAR_MOTOR_FORWARD_LEVEL, GPO_PUSH_PULL);
@@ -2766,21 +3782,42 @@ void car_nav_init(void)
     ips200_show_string(0, 16, car_mpu6050_ok ? "MPU6050 OK     " : "MPU6050 ERROR  ");
     ips200_show_string(0, 32, "KEEP STILL BIAS");
 
-    for(i = 0; i < CAR_GYRO_BIAS_SAMPLE_COUNT; i++)
+    if(car_mpu6050_ok)
     {
-        mpu6050_get_gyro();
-        gyro_sum += mpu6050_gyro_transition(mpu6050_gyro_z);
-        system_delay_ms(CAR_GYRO_BIAS_SAMPLE_DELAY_MS);
-    }
-    car_gyro_z_bias = gyro_sum / (float)CAR_GYRO_BIAS_SAMPLE_COUNT;
+        for(i = 0; i < CAR_GYRO_BIAS_SAMPLE_COUNT; i++)
+        {
+            mpu6050_get_gyro();
+            sample = mpu6050_gyro_transition(mpu6050_gyro_z);
+            gyro_sum += sample;
+            gyro_square_sum += sample * sample;
+            system_delay_ms(CAR_GYRO_BIAS_SAMPLE_DELAY_MS);
+        }
+        car_gyro_z_bias = gyro_sum / (float)CAR_GYRO_BIAS_SAMPLE_COUNT;
+        variance = gyro_square_sum / (float)CAR_GYRO_BIAS_SAMPLE_COUNT
+                - car_gyro_z_bias * car_gyro_z_bias;
+        if(!car_float_is_finite(car_gyro_z_bias) || !car_float_is_finite(variance)
+                || (variance > CAR_GYRO_BIAS_STD_MAX_DPS * CAR_GYRO_BIAS_STD_MAX_DPS))
+        {
+            car_mpu6050_ok = 0;
+        }
 
-    for(i = 0; i < CAR_ACC_BIAS_SAMPLE_COUNT; i++)
-    {
-        mpu6050_get_acc();
-        acc_sum += mpu6050_acc_transition(CAR_IMU_FORWARD_RAW);
-        system_delay_ms(CAR_GYRO_BIAS_SAMPLE_DELAY_MS);
+        for(i = 0; i < CAR_ACC_BIAS_SAMPLE_COUNT; i++)
+        {
+            mpu6050_get_acc();
+            sample = mpu6050_acc_transition(CAR_IMU_FORWARD_RAW);
+            acc_sum += sample;
+            acc_square_sum += sample * sample;
+            system_delay_ms(CAR_GYRO_BIAS_SAMPLE_DELAY_MS);
+        }
+        car_acc_forward_bias_g = acc_sum / (float)CAR_ACC_BIAS_SAMPLE_COUNT;
+        variance = acc_square_sum / (float)CAR_ACC_BIAS_SAMPLE_COUNT
+                - car_acc_forward_bias_g * car_acc_forward_bias_g;
+        if(!car_float_is_finite(car_acc_forward_bias_g) || !car_float_is_finite(variance)
+                || (variance > CAR_ACC_BIAS_STD_MAX_G * CAR_ACC_BIAS_STD_MAX_G))
+        {
+            car_mpu6050_ok = 0;
+        }
     }
-    car_acc_forward_bias_g = acc_sum / (float)CAR_ACC_BIAS_SAMPLE_COUNT;
     car_ekf_init_state(0.0f, 0.0f, 0.0f, 0.0f);
 
     gps_origin_lat = 0.0;
@@ -2809,8 +3846,32 @@ void car_nav_init(void)
 
     car_all_motor_stop();
     car_elapsed_ms = 0;
+    nav_uptime_ms = 0;
+    gps_publish_sequence = 0;
+    gps_update_pending = 0;
+    gps_raw_initialized = 0;
+    gps_seen_gga_count = gnss_gga_count;
+    gps_last_gga_ms = nav_uptime_ms;
+    gps_gga_seen = 0;
+    car_steer_encoder_count = 0;
+    key_last_a_level = CAR_KEY_RELEASE_LEVEL;
+    key_last_b_level = CAR_KEY_RELEASE_LEVEL;
+    key_a_cooldown = 0;
+    key_b_cooldown = 0;
+    ready_pending_key = 0;
+    ready_pending_count = 0;
+    ready_chord_count = 0;
+    ready_wait_release = 0;
     car_self_test_next_step(0);
-    car_state = CAR_STATE_SELF_TEST;
+    if(car_mpu6050_ok)
+    {
+        car_state = CAR_STATE_SELF_TEST;
+    }
+    else
+    {
+        car_error_code = CAR_ERROR_MPU;
+        car_state = CAR_STATE_ERROR;
+    }
     ips200_clear();
 }
 
