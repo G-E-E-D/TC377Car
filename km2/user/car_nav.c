@@ -3,7 +3,9 @@
 
 #pragma section all "cpu0_dsram"
 
-#define CAR_EARTH_RADIUS_M             (6378137.0)
+#define CAR_WGS84_A_M                  (6378137.0)
+#define CAR_WGS84_E2                   (0.00669437999014)
+#define CAR_LOCAL_DATUM_CAN_LOCK       ((!CAR_LOCAL_DATUM_FIXED_ENABLE) || CAR_LOCAL_DATUM_FIXED_CONFIGURED)
 #define CAR_EKF_STATE_DIM              (6)
 #define CAR_EKF_X                      (0)
 #define CAR_EKF_Y                      (1)
@@ -41,6 +43,9 @@ volatile float car_gps_y_m = 0.0f;
 volatile float car_gps_speed_mps = 0.0f;
 volatile float car_gps_direction_deg = 0.0f;
 volatile uint32 car_gps_fix_count = 0;
+volatile uint8 car_local_datum_ready = 0;
+volatile uint16 car_local_datum_sample_count = 0;
+volatile uint16 car_local_datum_reject_count = 0;
 volatile float car_ekf_pos_residual_m = 0.0f;
 volatile float car_ekf_speed_residual_mps = 0.0f;
 volatile float car_ekf_yaw_residual_deg = 0.0f;
@@ -77,7 +82,14 @@ volatile uint8 car_self_test_step = 0;
 
 static double gps_origin_lat = 0.0;
 static double gps_origin_lon = 0.0;
-static uint8 gps_origin_ready = 0;
+static double gps_origin_east_m_per_rad = 0.0;
+static double gps_origin_north_m_per_rad = 0.0;
+#if !CAR_LOCAL_DATUM_FIXED_ENABLE
+static double local_datum_mean_lat = 0.0;
+static double local_datum_mean_lon = 0.0;
+static double local_datum_lon_seed = 0.0;
+static uint8 local_datum_consecutive_rejects = 0;
+#endif
 static float gps_filter_x[CAR_GPS_FILTER_WINDOW] = {0.0f};
 static float gps_filter_y[CAR_GPS_FILTER_WINDOW] = {0.0f};
 static uint8 gps_filter_count = 0;
@@ -122,7 +134,9 @@ static car_pid_struct track_pid = {
 };
 
 static void car_path_calc_fixed_rear_pwm(void);
+#if CAR_LOCAL_DATUM_CAN_LOCK
 static void car_gps_filter_reset(void);
+#endif
 static void car_path_prepare(void);
 
 static float car_abs_f(float value)
@@ -193,6 +207,7 @@ static float car_gps_course_to_math_yaw(float gps_course_deg)
     return car_angle_to_360(90.0f - gps_course_deg);
 }
 
+#if CAR_LOCAL_DATUM_CAN_LOCK
 static void car_gps_filter_reset(void)
 {
     uint8 i;
@@ -207,6 +222,7 @@ static void car_gps_filter_reset(void)
     car_gps_x_m = 0.0f;
     car_gps_y_m = 0.0f;
 }
+#endif
 
 static float car_gps_median(const float *samples, uint8 count)
 {
@@ -958,6 +974,12 @@ static void car_reset_runtime_pose_at(float x_m, float y_m, float yaw_deg, uint8
 
 static void car_start_recording(void)
 {
+    if(!car_local_datum_ready)
+    {
+        car_error_code = CAR_ERROR_DATUM_NOT_READY;
+        car_all_motor_stop();
+        return;
+    }
     if(!car_gps_valid || (gps_valid_fix_streak < CAR_GPS_READY_FIX_COUNT))
     {
         car_error_code = CAR_ERROR_GPS_LOST;
@@ -1007,7 +1029,8 @@ static void car_start_guide(car_replay_mode_enum mode)
     float start_distance_m;
     uint32 start_index;
 
-    if(car_path_prepared && (car_path_count >= CAR_START_MIN_POINTS) && car_gps_valid
+    if(car_path_prepared && (car_path_count >= CAR_START_MIN_POINTS)
+            && car_local_datum_ready && car_gps_valid
             && (gps_valid_fix_streak >= CAR_GPS_READY_FIX_COUNT))
     {
         start_index = (CAR_REPLAY_B_RETURN == mode) ? (car_path_count - 1) : 0;
@@ -1040,8 +1063,18 @@ static void car_start_guide(car_replay_mode_enum mode)
     }
     else
     {
-        car_error_code = (!car_path_prepared || (car_path_count < CAR_START_MIN_POINTS))
-                ? CAR_ERROR_PATH_SHORT : CAR_ERROR_GPS_LOST;
+        if(!car_path_prepared || (car_path_count < CAR_START_MIN_POINTS))
+        {
+            car_error_code = CAR_ERROR_PATH_SHORT;
+        }
+        else if(!car_local_datum_ready)
+        {
+            car_error_code = CAR_ERROR_DATUM_NOT_READY;
+        }
+        else
+        {
+            car_error_code = CAR_ERROR_GPS_LOST;
+        }
         car_state = CAR_STATE_ERROR;
         car_all_motor_stop();
     }
@@ -1057,14 +1090,209 @@ static double car_signed_lon(double lon, int8 ew)
     return (('W' == ew) || ('w' == ew)) ? -lon : lon;
 }
 
+static double car_lon_near_reference(double lon, double reference_lon)
+{
+    while((lon - reference_lon) > 180.0)  lon -= 360.0;
+    while((lon - reference_lon) < -180.0) lon += 360.0;
+    return lon;
+}
+
+#if CAR_LOCAL_DATUM_CAN_LOCK
+static double car_normalize_lon(double lon)
+{
+    while(lon > 180.0)  lon -= 360.0;
+    while(lon < -180.0) lon += 360.0;
+    return lon;
+}
+
+static void car_wgs84_local_scales(double lat, double *east_m_per_rad, double *north_m_per_rad)
+{
+    double lat_rad = lat * (double)CAR_DEG_TO_RAD;
+    double sin_lat = sin(lat_rad);
+    double cos_lat = cos(lat_rad);
+    double denominator = 1.0 - CAR_WGS84_E2 * sin_lat * sin_lat;
+    double sqrt_denominator = sqrt(denominator);
+    double prime_vertical_radius = CAR_WGS84_A_M / sqrt_denominator;
+    double meridian_radius = CAR_WGS84_A_M * (1.0 - CAR_WGS84_E2)
+            / (denominator * sqrt_denominator);
+
+    *east_m_per_rad = prime_vertical_radius * cos_lat;
+    *north_m_per_rad = meridian_radius;
+}
+
+static void car_local_datum_lock(double lat, double lon)
+{
+    gps_origin_lat = lat;
+    gps_origin_lon = car_normalize_lon(lon);
+    car_wgs84_local_scales(gps_origin_lat,
+            &gps_origin_east_m_per_rad, &gps_origin_north_m_per_rad);
+    car_gps_filter_reset();
+    gps_valid_fix_streak = 0;
+    gps_update_pending = 0;
+    if(CAR_ERROR_DATUM_NOT_READY == car_error_code)
+    {
+        car_error_code = CAR_ERROR_NONE;
+    }
+    car_local_datum_ready = 1;
+}
+#endif
+
+#if !CAR_LOCAL_DATUM_FIXED_ENABLE
+static void car_local_datum_candidate_reset(void)
+{
+    local_datum_mean_lat = 0.0;
+    local_datum_mean_lon = 0.0;
+    local_datum_lon_seed = 0.0;
+    local_datum_consecutive_rejects = 0;
+    car_local_datum_sample_count = 0;
+}
+
+static void car_local_datum_candidate_seed(double lat, double lon)
+{
+    local_datum_mean_lat = lat;
+    local_datum_mean_lon = lon;
+    local_datum_lon_seed = lon;
+    local_datum_consecutive_rejects = 0;
+    car_local_datum_sample_count = 1;
+}
+#endif
+
+#if CAR_LOCAL_DATUM_CAN_LOCK
+static float car_geo_delta_m(double ref_lat, double ref_lon, double lat, double lon)
+{
+    double east_m_per_rad;
+    double north_m_per_rad;
+    double d_lat = (lat - ref_lat) * (double)CAR_DEG_TO_RAD;
+    double d_lon = (car_lon_near_reference(lon, ref_lon) - ref_lon) * (double)CAR_DEG_TO_RAD;
+    double dx;
+    double dy;
+
+    car_wgs84_local_scales(ref_lat, &east_m_per_rad, &north_m_per_rad);
+    dx = d_lon * east_m_per_rad;
+    dy = d_lat * north_m_per_rad;
+
+    return (float)sqrt(dx * dx + dy * dy);
+}
+#endif
+
+#if CAR_LOCAL_DATUM_FIXED_ENABLE
+static uint8 car_local_datum_fixed_try_lock(double live_lat, double live_lon)
+{
+    if(CAR_STATE_WAIT_START != car_state)
+    {
+        return 0;
+    }
+#if CAR_LOCAL_DATUM_FIXED_CONFIGURED
+    double fixed_lat = CAR_LOCAL_DATUM_FIXED_LAT_DEG;
+    double fixed_lon = CAR_LOCAL_DATUM_FIXED_LON_DEG;
+
+    if((fixed_lat >= -90.0) && (fixed_lat <= 90.0)
+            && (fixed_lon >= -180.0) && (fixed_lon <= 180.0)
+            && (car_geo_delta_m(fixed_lat, fixed_lon, live_lat, live_lon)
+                    <= CAR_LOCAL_DATUM_FIXED_MAX_DIST_M))
+    {
+        car_local_datum_sample_count = CAR_LOCAL_DATUM_SAMPLE_COUNT;
+        car_local_datum_lock(fixed_lat, fixed_lon);
+        return 1;
+    }
+#else
+    (void)live_lat;
+    (void)live_lon;
+#endif
+    car_error_code = CAR_ERROR_DATUM_NOT_READY;
+    return 0;
+}
+#else
+static uint8 car_local_datum_update(double lat, double lon, float gps_speed_mps)
+{
+    double lon_near;
+    double next_count;
+    float sample_distance_m;
+
+    if(car_local_datum_ready)
+    {
+        return 1;
+    }
+    if((CAR_STATE_WAIT_START != car_state)
+            || !(gps_speed_mps >= 0.0f)
+            || !(gps_speed_mps <= CAR_LOCAL_DATUM_MAX_SPEED_MPS))
+    {
+        car_local_datum_candidate_reset();
+        return 0;
+    }
+
+    if(0 == car_local_datum_sample_count)
+    {
+        car_local_datum_candidate_seed(lat, lon);
+    }
+    else
+    {
+        lon_near = car_lon_near_reference(lon, local_datum_lon_seed);
+        sample_distance_m = car_geo_delta_m(local_datum_mean_lat, local_datum_mean_lon, lat, lon_near);
+        if(sample_distance_m > CAR_LOCAL_DATUM_MAX_RADIUS_M)
+        {
+            if(car_local_datum_reject_count < 65535U)
+            {
+                car_local_datum_reject_count++;
+            }
+            if(local_datum_consecutive_rejects < 255U)
+            {
+                local_datum_consecutive_rejects++;
+            }
+            // Isolated jumps are discarded. A small/shifted cluster is reseeded so an
+            // early bad fix or a sustained cold-start drift cannot block acquisition.
+            if((car_local_datum_sample_count < 3U)
+                    || (local_datum_consecutive_rejects >= CAR_LOCAL_DATUM_RESEED_REJECTS))
+            {
+                car_local_datum_candidate_seed(lat, lon);
+            }
+            return 0;
+        }
+
+        local_datum_consecutive_rejects = 0;
+        next_count = (double)car_local_datum_sample_count + 1.0;
+        local_datum_mean_lat += (lat - local_datum_mean_lat) / next_count;
+        local_datum_mean_lon += (lon_near - local_datum_mean_lon) / next_count;
+        car_local_datum_sample_count++;
+    }
+
+    if(car_local_datum_sample_count >= CAR_LOCAL_DATUM_SAMPLE_COUNT)
+    {
+        car_local_datum_sample_count = CAR_LOCAL_DATUM_SAMPLE_COUNT;
+        car_local_datum_lock(local_datum_mean_lat, local_datum_mean_lon);
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 static void car_gps_to_local(double lat, double lon, float *x, float *y)
 {
-    double lat0_rad = gps_origin_lat * (double)CAR_DEG_TO_RAD;
     double d_lat = (lat - gps_origin_lat) * (double)CAR_DEG_TO_RAD;
-    double d_lon = (lon - gps_origin_lon) * (double)CAR_DEG_TO_RAD;
+    double d_lon = (car_lon_near_reference(lon, gps_origin_lon) - gps_origin_lon) * (double)CAR_DEG_TO_RAD;
 
-    *x = (float)(d_lon * cos(lat0_rad) * CAR_EARTH_RADIUS_M);
-    *y = (float)(d_lat * CAR_EARTH_RADIUS_M);
+    *x = (float)(d_lon * gps_origin_east_m_per_rad);
+    *y = (float)(d_lat * gps_origin_north_m_per_rad);
+}
+
+static void car_gps_clear_valid_fix(void)
+{
+    car_gps_valid = 0;
+    gps_valid_fix_streak = 0;
+#if !CAR_LOCAL_DATUM_FIXED_ENABLE
+    if(!car_local_datum_ready)
+    {
+        car_local_datum_candidate_reset();
+    }
+#endif
+}
+
+static void car_gps_check_stale(void)
+{
+    if((nav_uptime_ms - gps_last_update_ms) > CAR_GPS_STALE_MS)
+    {
+        car_gps_clear_valid_fix();
+    }
 }
 
 void car_nav_gnss_poll(void)
@@ -1073,14 +1301,12 @@ void car_nav_gnss_poll(void)
     double lon;
     float raw_x;
     float raw_y;
+    uint8 fix_valid;
 
+    // Check RMC age even while GGA/THS frames keep gnss_flag active.
+    car_gps_check_stale();
     if(!gnss_flag)
     {
-        if((nav_uptime_ms - gps_last_update_ms) > CAR_GPS_STALE_MS)
-        {
-            car_gps_valid = 0;
-            gps_valid_fix_streak = 0;
-        }
         return;
     }
 
@@ -1093,35 +1319,57 @@ void car_nav_gnss_poll(void)
     }
     gnss_rmc_flag = 0;
 
+    fix_valid = (gnss.state && (gnss.satellite_used >= CAR_GPS_MIN_SATELLITES)) ? 1 : 0;
+    gps_last_update_ms = nav_uptime_ms;
     car_gps_satellites = gnss.satellite_used;
-    car_gps_valid = (gnss.state && (gnss.satellite_used >= CAR_GPS_MIN_SATELLITES)) ? 1 : 0;
-    car_gps_speed_mps = gnss.speed / 3.6f;
-    car_gps_direction_deg = car_gps_course_to_math_yaw(gnss.direction);
 
-    if(!car_gps_valid)
+    if(!fix_valid)
     {
-        gps_valid_fix_streak = 0;
+        car_gps_clear_valid_fix();
         return;
-    }
-    if(gps_valid_fix_streak < CAR_GPS_READY_FIX_COUNT)
-    {
-        gps_valid_fix_streak++;
     }
 
     lat = car_signed_lat(gnss.latitude, gnss.ns);
     lon = car_signed_lon(gnss.longitude, gnss.ew);
-    if(!gps_origin_ready)
+    car_gps_speed_mps = gnss.speed / 3.6f;
+    if(!((lat >= -90.0) && (lat <= 90.0)
+            && (lon >= -180.0) && (lon <= 180.0)
+            && ((gnss.ns == 'N') || (gnss.ns == 'n') || (gnss.ns == 'S') || (gnss.ns == 's'))
+            && ((gnss.ew == 'E') || (gnss.ew == 'e') || (gnss.ew == 'W') || (gnss.ew == 'w'))
+            && (car_gps_speed_mps >= 0.0f)
+            && (car_gps_speed_mps <= CAR_GPS_DATA_MAX_SPEED_MPS)
+            && (gnss.direction >= 0.0f) && (gnss.direction <= 360.0f)))
     {
-        gps_origin_lat = lat;
-        gps_origin_lon = lon;
-        gps_origin_ready = 1;
-        car_gps_filter_reset();
+        car_gps_clear_valid_fix();
+        return;
+    }
+    car_gps_direction_deg = car_gps_course_to_math_yaw(gnss.direction);
+    // Publish validity only after the frame timestamp and all semantic checks are complete.
+    car_gps_valid = 1;
+
+    if(!car_local_datum_ready)
+    {
+        gps_valid_fix_streak = 0;
+#if !CAR_LOCAL_DATUM_FIXED_ENABLE
+        if(!car_local_datum_update(lat, lon, car_gps_speed_mps))
+        {
+            return;
+        }
+#else
+        if(!car_local_datum_fixed_try_lock(lat, lon))
+        {
+            return;
+        }
+#endif
     }
 
     car_gps_to_local(lat, lon, &raw_x, &raw_y);
     car_gps_filter_update(raw_x, raw_y);
+    if(gps_valid_fix_streak < CAR_GPS_READY_FIX_COUNT)
+    {
+        gps_valid_fix_streak++;
+    }
     car_gps_fix_count++;
-    gps_last_update_ms = nav_uptime_ms;
 
     gps_pending_x_m = car_gps_x_m;
     gps_pending_y_m = car_gps_y_m;
@@ -2209,6 +2457,8 @@ void car_nav_background(void)
 static void car_display_state_text(uint16 x, uint16 y)
 {
     if(CAR_STATE_SELF_TEST == car_state)         ips200_show_string(x, y, "SELF  ");
+    else if((CAR_STATE_WAIT_START == car_state) && !car_local_datum_ready)
+                                                    ips200_show_string(x, y, "DATUM ");
     else if(CAR_STATE_WAIT_START == car_state)   ips200_show_string(x, y, "WAIT  ");
     else if(CAR_STATE_RECORDING == car_state)    ips200_show_string(x, y, "REC   ");
     else if(CAR_STATE_PROCESSING == car_state)   ips200_show_string(x, y, "SMOOTH");
@@ -2393,10 +2643,24 @@ static void car_display_ready(void)
     ips200_show_string(136, 32, "EC:");
     ips200_show_uint(160, 32, car_error_code, 1);
 
-    ips200_show_string(0, 48, "PATH:");
-    ips200_show_uint(48, 48, car_path_count, 4);
-    ips200_show_string(104, 48, "YAW:");
-    ips200_show_float(144, 48, car_yaw_deg, 4, 1);
+    if(CAR_STATE_WAIT_START == car_state)
+    {
+        ips200_show_string(0, 48, "DAT:");
+        ips200_show_uint(40, 48, car_local_datum_ready, 1);
+        ips200_show_string(64, 48, "N:");
+        ips200_show_uint(88, 48, car_local_datum_sample_count, 3);
+        ips200_show_string(112, 48, "/");
+        ips200_show_uint(120, 48, CAR_LOCAL_DATUM_SAMPLE_COUNT, 3);
+        ips200_show_string(152, 48, "RJ:");
+        ips200_show_uint(184, 48, car_local_datum_reject_count, 3);
+    }
+    else
+    {
+        ips200_show_string(0, 48, "PATH:");
+        ips200_show_uint(48, 48, car_path_count, 4);
+        ips200_show_string(104, 48, "YAW:");
+        ips200_show_float(144, 48, car_yaw_deg, 4, 1);
+    }
 
     ips200_show_string(0, 64, "ENC:");
     ips200_show_int(40, 64, car_steer_encoder_count, 6);
@@ -2405,7 +2669,29 @@ static void car_display_ready(void)
 
     if(CAR_STATE_WAIT_START == car_state)
     {
-        ips200_show_string(0, 80, "KEY A: TEACH (GPS READY)");
+        if(!car_local_datum_ready)
+        {
+#if CAR_LOCAL_DATUM_FIXED_ENABLE
+            if(CAR_ERROR_DATUM_NOT_READY == car_error_code)
+            {
+                ips200_show_string(0, 80, "CHECK FIXED DATUM CONFIG/POS  ");
+            }
+            else
+            {
+                ips200_show_string(0, 80, "WAIT GPS: VERIFY FIXED DATUM  ");
+            }
+#else
+            ips200_show_string(0, 80, "AT START KEEP STILL: DATUM    ");
+#endif
+        }
+        else if(gps_valid_fix_streak < CAR_GPS_READY_FIX_COUNT)
+        {
+            ips200_show_string(0, 80, "DATUM OK: WAIT GPS STABLE     ");
+        }
+        else
+        {
+            ips200_show_string(0, 80, "DATUM OK: KEY A TO TEACH      ");
+        }
     }
     else if((CAR_STATE_READY == car_state) || (CAR_STATE_FINISHED == car_state))
     {
@@ -2496,6 +2782,27 @@ void car_nav_init(void)
     }
     car_acc_forward_bias_g = acc_sum / (float)CAR_ACC_BIAS_SAMPLE_COUNT;
     car_ekf_init_state(0.0f, 0.0f, 0.0f, 0.0f);
+
+    gps_origin_lat = 0.0;
+    gps_origin_lon = 0.0;
+    gps_origin_east_m_per_rad = 0.0;
+    gps_origin_north_m_per_rad = 0.0;
+    car_local_datum_ready = 0;
+    car_local_datum_sample_count = 0;
+    car_local_datum_reject_count = 0;
+#if CAR_LOCAL_DATUM_FIXED_ENABLE
+#if CAR_LOCAL_DATUM_FIXED_CONFIGURED
+    if(!((CAR_LOCAL_DATUM_FIXED_LAT_DEG >= -90.0) && (CAR_LOCAL_DATUM_FIXED_LAT_DEG <= 90.0)
+            && (CAR_LOCAL_DATUM_FIXED_LON_DEG >= -180.0) && (CAR_LOCAL_DATUM_FIXED_LON_DEG <= 180.0)))
+    {
+        car_error_code = CAR_ERROR_DATUM_NOT_READY;
+    }
+#else
+    car_error_code = CAR_ERROR_DATUM_NOT_READY;
+#endif
+#else
+    car_local_datum_candidate_reset();
+#endif
 
     ips200_show_string(0, 48, "GNSS INIT...");
     gnss_init(CAR_GNSS_DEVICE);

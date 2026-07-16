@@ -18,6 +18,7 @@
 #define CAR_ERROR_START_TOO_FAR        (4)
 #define CAR_ERROR_GPS_CORRIDOR         (5)
 #define CAR_ERROR_GUIDE_TIMEOUT        (6)
+#define CAR_ERROR_DATUM_NOT_READY      (7)
 
 #define CAR_LEFT_MOTOR_DIR_PIN         (P21_4)
 #define CAR_LEFT_MOTOR_PWM_CH          (ATOM0_CH3_P21_5)
@@ -132,9 +133,19 @@
 #define CAR_GPS_MIN_SATELLITES         (6)
 #define CAR_GPS_READY_FIX_COUNT        (10)          // Require consecutive valid frames before a key can start motion.
 #define CAR_ALLOW_RECORD_WITHOUT_GPS   (0)
+#define CAR_LOCAL_DATUM_FIXED_ENABLE   (0)           // 0: average fixes at power-on; 1: use the surveyed coordinates below.
+#define CAR_LOCAL_DATUM_FIXED_CONFIGURED (0)         // Set to 1 only after entering and checking both fixed coordinates.
+#define CAR_LOCAL_DATUM_FIXED_LAT_DEG  (0.0)         // WGS-84 decimal degrees; fill before enabling fixed mode.
+#define CAR_LOCAL_DATUM_FIXED_LON_DEG  (0.0)
+#define CAR_LOCAL_DATUM_FIXED_MAX_DIST_M (500.0f)    // Refuse a fixed datum implausibly far from the live receiver.
+#define CAR_LOCAL_DATUM_SAMPLE_COUNT   (50)          // Keep still for 50 valid 10Hz RMC fixes (about 5 seconds).
+#define CAR_LOCAL_DATUM_MAX_SPEED_MPS  (0.20f)       // Restart averaging if the receiver reports motion.
+#define CAR_LOCAL_DATUM_MAX_RADIUS_M   (1.50f)       // Every accepted fix must stay near the running mean.
+#define CAR_LOCAL_DATUM_RESEED_REJECTS (3)           // A sustained shift restarts the cluster; isolated jumps are discarded.
 #define CAR_GPS_FILTER_WINDOW          (3)
 #define CAR_GPS_FILTER_ALPHA           (0.55f)
 #define CAR_GPS_STALE_MS               (600)
+#define CAR_GPS_DATA_MAX_SPEED_MPS     (20.0f)       // Reject corrupt/non-finite RMC speed before fusion.
 #define CAR_GPS_POS_BLEND              (0.015f)
 #define CAR_GPS_YAW_BLEND              (0.010f)
 #define CAR_GPS_YAW_MIN_SPEED_KMH      (3.0f)        // Low-speed course is noisy; use steering encoder yaw instead.
@@ -218,6 +229,6 @@
 #define CAR_SPEED_FEEDFORWARD          (2800.0f)
 #define CAR_SIGNED_SPEED_DEADBAND_MPS  (0.06f)
 
-#define CAR_APP_VERSION_TEXT           "KM2_AB_20260716E"
+#define CAR_APP_VERSION_TEXT           "KM2_AB_20260716F"
 
 #endif
