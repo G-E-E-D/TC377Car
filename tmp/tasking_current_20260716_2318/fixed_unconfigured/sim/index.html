@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KM2 EKF Trajectory Simulator</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main class="app-shell">
+    <section class="workspace" aria-label="trajectory simulator">
+      <canvas id="simCanvas" width="1200" height="720"></canvas>
+      <div class="hud">
+        <div><span>STA</span><strong id="hudState">READY</strong></div>
+        <div><span>MODE</span><strong id="hudMode">TIME</strong></div>
+        <div><span>GPS</span><strong id="hudGps">ON</strong></div>
+        <div><span>PATH</span><strong id="hudPath">0</strong></div>
+        <div><span>EKF</span><strong id="hudEkf">0</strong></div>
+      </div>
+    </section>
+
+    <aside class="side">
+      <section class="panel controls">
+        <div class="toolbar">
+          <button id="btnTeach" type="button">REC</button>
+          <button id="btnGuide" type="button">GUIDE</button>
+          <button id="btnReset" type="button">CLR</button>
+        </div>
+        <div class="tool-row">
+          <label class="toggle"><input id="gpsToggle" type="checkbox" checked> GPS</label>
+          <label class="toggle"><input id="noiseToggle" type="checkbox"> NOISE</label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h1>Control</h1>
+        <label>SPD_SCALE <output id="speedScaleValue">0.70</output>
+          <input id="speedScale" type="range" min="0.20" max="1.20" value="0.70" step="0.05">
+        </label>
+        <label>YAW_K <output id="yawGainValue">9.0</output>
+          <input id="yawGain" type="range" min="0" max="20" value="9" step="0.5">
+        </label>
+        <label>RATE_K <output id="rateGainValue">2.0</output>
+          <input id="rateGain" type="range" min="0" max="10" value="2" step="0.2">
+        </label>
+        <label>CTE_K <output id="cteGainValue">120</output>
+          <input id="cteGain" type="range" min="0" max="260" value="120" step="10">
+        </label>
+        <label>STEER_RESP <output id="steerRespValue">0.16</output>
+          <input id="steerResp" type="range" min="0.04" max="0.35" value="0.16" step="0.01">
+        </label>
+      </section>
+
+      <section class="panel">
+        <h1>EKF</h1>
+        <label>R_POS <output id="rPosValue">1.00</output>
+          <input id="rPos" type="range" min="0.20" max="4.00" value="1.00" step="0.10">
+        </label>
+        <label>R_SPD <output id="rSpeedValue">0.04</output>
+          <input id="rSpeed" type="range" min="0.01" max="0.30" value="0.04" step="0.01">
+        </label>
+        <label>Q_SPD <output id="qSpeedValue">0.018</output>
+          <input id="qSpeed" type="range" min="0.002" max="0.080" value="0.018" step="0.002">
+        </label>
+      </section>
+
+      <section class="panel metrics">
+        <h1>Diag</h1>
+        <dl>
+          <div><dt>YAW</dt><dd id="mYaw">0.0 deg</dd></div>
+          <div><dt>GYZ</dt><dd id="mGyro">0.0 dps</dd></div>
+          <div><dt>VEL</dt><dd id="mVel">0.00 m/s</dd></div>
+          <div><dt>IDX</dt><dd id="mIdx">0 / 0</dd></div>
+          <div><dt>HE</dt><dd id="mHead">0.0 deg</dd></div>
+          <div><dt>RE</dt><dd id="mRate">0.0 dps</dd></div>
+          <div><dt>CTE</dt><dd id="mCte">0.00 m</dd></div>
+          <div><dt>TS</dt><dd id="mTs">0.00 m/s</dd></div>
+          <div><dt>ST/ENC</dt><dd id="mSteer">0 / 0</dd></div>
+          <div><dt>RPWM</dt><dd id="mRearPwm">0</dd></div>
+          <div><dt>SPWM</dt><dd id="mSteerPwm">0</dd></div>
+          <div><dt>DIR</dt><dd id="mDir">0</dd></div>
+          <div><dt>EKF</dt><dd id="mEkf">0</dd></div>
+          <div><dt>ER</dt><dd id="mEr">0.00 m</dd></div>
+          <div><dt>EST XY</dt><dd id="mEst">0.0, 0.0</dd></div>
+          <div><dt>TRUE XY</dt><dd id="mTrue">0.0, 0.0</dd></div>
+        </dl>
+      </section>
+
+      <section class="panel help">
+        <h1>Keys</h1>
+        <p><kbd>W</kbd>/<kbd>S</kbd> throttle, <kbd>A</kbd>/<kbd>D</kbd> steer, <kbd>Space</kbd> brake, <kbd>R</kbd> record, <kbd>G</kbd> guide.</p>
+      </section>
+    </aside>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>
